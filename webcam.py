@@ -1,32 +1,34 @@
 import sys
 import time
+import math
 import cv2
 import numpy as np
 from ultralytics import YOLO
 
-# 1. Load fine-tuned drone detector model
+# ---------------------------------------------------------
+# 1. LOAD FINE-TUNED DRONE DETECTOR MODEL
+# ---------------------------------------------------------
 MODEL_PATH = "models/best.pt"
 model = YOLO(MODEL_PATH)
 
-# Drone class index lookup (default 0)
 DRONE_CLASS_ID = 0
 for cls_id, name in model.names.items():
     if "drone" in name.lower():
         DRONE_CLASS_ID = cls_id
         break
 
-# 2. External & Built-in Camera Setup (DirectShow for Windows, AVFoundation/Any for macOS)
+# ---------------------------------------------------------
+# 2. CAMERA SETUP & SENSOR CALIBRATION PARAMETERS
+# ---------------------------------------------------------
 cap = None
 is_windows = sys.platform.startswith("win")
 backend = cv2.CAP_DSHOW if is_windows else cv2.CAP_ANY
 
-# Prioritize external cameras (index 1, 2, then 0)
 for cam_idx in [1, 2, 0, 3]:
     temp_cap = cv2.VideoCapture(cam_idx, backend)
     if not temp_cap.isOpened():
         temp_cap = cv2.VideoCapture(cam_idx)
     if temp_cap.isOpened():
-        # Test reading a frame to confirm camera is active
         ret, test_frame = temp_cap.read()
         if ret and test_frame is not None:
             cap = temp_cap
@@ -36,36 +38,117 @@ for cam_idx in [1, 2, 0, 3]:
             temp_cap.release()
 
 if cap is None or not cap.isOpened():
-    print("ERROR: Could not open any camera. Please ensure external camera is plugged in.")
+    print("ERROR: Could not open camera. Please check camera connections.")
     exit(1)
 
-# Set high resolution for maximum long-distance pixel clarity (1080p -> 720p fallback)
+# Set high resolution
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
 cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)
 
-WINDOW_NAME = "Drone Detection System - Long Range Tracker"
+WINDOW_NAME = "Drone Defense System - CRLB Range & Kinematics Engine"
 cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
 
-# Real-time state: Default 35% sensitivity for long-distance drone capture
+# ---------------------------------------------------------
+# 3. CRAMER-RAO LOWER BOUND (CRLB) & PHYSICAL TARGET MODELS
+# ---------------------------------------------------------
+# Camera Optical Model: Focal length in pixels (calibrated for standard ~80 deg HFOV at 1080p/720p)
+FOCAL_LENGTH_PX = 1150.0   # Updated dynamically if resolution changes
+SIGMA_PIXEL = 1.5          # Bounding box edge localization noise std-dev (pixels)
+
+# Drone Physical Size Profiles (Wingspan in meters)
+DRONE_PROFILES = {
+    1: {"name": "Micro/Mini", "width": 0.24, "desc": "DJI Mini / Avata (24cm)"},
+    2: {"name": "Standard Quad", "width": 0.38, "desc": "Mavic / Phantom / FPV (38cm) [DEFAULT]"},
+    3: {"name": "Heavy Lift", "width": 0.75, "desc": "Matrice / Hexacopter (75cm)"},
+    4: {"name": "Tactical Wing", "width": 1.40, "desc": "Fixed-Wing / Loitering (140cm)"}
+}
+active_profile_id = 2
+target_nominal_width = DRONE_PROFILES[active_profile_id]["width"]
+
+def compute_crlb_distance(pixel_w, pixel_h, target_w, focal_length, sigma_w):
+    """
+    Computes Deterministic Monocular Distance and the theoretical
+    Cramer-Rao Lower Bound (CRLB) / Fisher Information bounds.
+    
+    Measurement Model: w = (W * F) / D + epsilon, where epsilon ~ N(0, sigma_w^2)
+    Sensitivity Derivative: dw/dD = -(W * F) / D^2
+    Fisher Information I(D) = (1 / sigma_w^2) * (dw/dD)^2 = (W^2 * F^2) / (sigma_w^2 * D^4)
+    CRLB(D) = 1 / I(D) = (sigma_w^2 * D^4) / (W^2 * F^2)
+    Minimum Standard Error: sigma_D = sqrt(CRLB) = (sigma_w * D^2) / (W * F)
+    """
+    pixel_w = max(2.0, float(pixel_w))
+    # Estimated Distance (Z in meters)
+    distance_z = (target_w * focal_length) / pixel_w
+    
+    # Fisher Information & CRLB Variance
+    fisher_info = (target_w**2 * focal_length**2) / ((sigma_w**2) * (distance_z**4))
+    crlb_variance = 1.0 / max(1e-9, fisher_info)
+    sigma_d = math.sqrt(crlb_variance)
+    
+    # 95% Confidence Interval (2-sigma theoretical bound)
+    ci_lower = max(0.2, distance_z - 2.0 * sigma_d)
+    ci_upper = distance_z + 2.0 * sigma_d
+    
+    return distance_z, sigma_d, ci_lower, ci_upper, crlb_variance
+
+# ---------------------------------------------------------
+# 4. KINEMATIC TRACKER MEMORY (3D State, Velocity, History)
+# ---------------------------------------------------------
+class TargetKinematics:
+    def __init__(self, track_id):
+        self.track_id = track_id
+        self.history = []  # [(timestamp, x, y, z, dist, sigma_d)]
+        self.hits = 0
+        self.last_frame = 0
+        self.smoothed_z = None
+        self.velocity_3d = (0.0, 0.0, 0.0)  # vx, vy, vz in m/s
+        self.speed_kmh = 0.0
+        self.approach_rate = 0.0  # m/s (+ approaching, - receding)
+        self.eta_seconds = None
+
+    def update(self, frame_num, timestamp, x_m, y_m, z_m, sigma_d):
+        self.hits += 1
+        self.last_frame = frame_num
+
+        # Exponential Moving Average for jitter reduction
+        if self.smoothed_z is None:
+            self.smoothed_z = z_m
+        else:
+            alpha = 0.35  # Smoothing factor
+            self.smoothed_z = alpha * z_m + (1.0 - alpha) * self.smoothed_z
+
+        self.history.append((timestamp, x_m, y_m, self.smoothed_z, sigma_d))
+        if len(self.history) > 30:
+            self.history.pop(0)
+
+        # Calculate 3D Velocity & Approach Rate if we have enough temporal baseline (>= 0.15s)
+        if len(self.history) >= 4:
+            t_old, x_old, y_old, z_old, _ = self.history[-4]
+            dt = timestamp - t_old
+            if dt > 0.05:
+                vx = (x_m - x_old) / dt
+                vy = (y_m - y_old) / dt
+                vz = (self.smoothed_z - z_old) / dt
+                self.velocity_3d = (vx, vy, vz)
+                self.speed_kmh = math.sqrt(vx**2 + vy**2 + vz**2) * 3.6
+                
+                # Approach rate (closing speed along z-axis)
+                self.approach_rate = -vz  # Positive when closing in
+                if self.approach_rate > 0.8:
+                    self.eta_seconds = max(0.1, self.smoothed_z / self.approach_rate)
+                else:
+                    self.eta_seconds = None
+
+tracks_db = {}
+MIN_CONSECUTIVE_FRAMES = 3
+MAX_MISSED_FRAMES = 15
+
+# UI State
 conf_percent = 35
 brightness_boost = 0
 dragging_slider = False
-
-def on_trackbar(val):
-    global conf_percent
-    conf_percent = max(10, min(95, val))
-
-try:
-    cv2.createTrackbar("Conf (%)", WINDOW_NAME, conf_percent, 95, on_trackbar)
-except Exception:
-    pass
-
-# Slider layout configuration for On-Screen HUD (OSD)
-SLIDER_X1 = 145
-SLIDER_X2 = 520
-SLIDER_Y1 = 0
-SLIDER_Y2 = 0
+SLIDER_X1, SLIDER_X2, SLIDER_Y1, SLIDER_Y2 = 145, 520, 0, 0
 
 def handle_mouse(event, x, y, flags, param):
     global conf_percent, dragging_slider, SLIDER_X1, SLIDER_X2, SLIDER_Y1, SLIDER_Y2
@@ -74,39 +157,27 @@ def handle_mouse(event, x, y, flags, param):
             dragging_slider = True
             norm_val = (x - SLIDER_X1) / max(1, (SLIDER_X2 - SLIDER_X1))
             conf_percent = int(max(10, min(95, 10 + norm_val * 85)))
-            try:
-                cv2.setTrackbarPos("Conf (%)", WINDOW_NAME, conf_percent)
-            except Exception:
-                pass
     elif event == cv2.EVENT_MOUSEMOVE and dragging_slider:
         norm_val = (x - SLIDER_X1) / max(1, (SLIDER_X2 - SLIDER_X1))
         conf_percent = int(max(10, min(95, 10 + norm_val * 85)))
-        try:
-            cv2.setTrackbarPos("Conf (%)", WINDOW_NAME, conf_percent)
-        except Exception:
-            pass
     elif event == cv2.EVENT_LBUTTONUP:
         dragging_slider = False
 
 cv2.setMouseCallback(WINDOW_NAME, handle_mouse)
 
-# Track persistence memory (track_id -> frame_hits)
-track_hits = {}
-MIN_CONSECUTIVE_FRAMES = 2  # Responsive confirmation for distant fast targets
-MAX_MISSED_FRAMES = 15      # Keep locked even if drone momentarily turns/banks
-track_last_seen = {}
-
 prev_time = time.time()
 frame_count = 0
 
-print("\n" + "=" * 60)
-print("  LONG-RANGE DRONE DETECTION SYSTEM ACTIVATED")
-print("  - Optimized for distant objects with High-Res Inference (1280px)")
-print("  - Sensitivity: Click/drag bottom bar or use [ / ] keys")
-print("  - Light/Brightness: Press 'b' / 'B' to adjust light compensation")
-print("  - Press 'q' or ESC to exit")
-print("=" * 60 + "\n")
+print("\n" + "=" * 65)
+print("  AIRSPACE DRONE TRACKING & CRLB ESTIMATION ENGINE ONLINE")
+print("  - CRLB: Active (Analytical Fisher Information & Bounds)")
+print("  - Target Profiles: Press [1, 2, 3, 4] to change drone size baseline")
+print("  - Sensitivity: [ / ] or click bottom bar | Light: B | Quit: Q")
+print("=" * 65 + "\n")
 
+# ---------------------------------------------------------
+# 5. MAIN REAL-TIME ESTIMATION & TRACKING LOOP
+# ---------------------------------------------------------
 while True:
     ret, frame = cap.read()
     if not ret:
@@ -115,18 +186,21 @@ while True:
 
     frame_count += 1
     current_time = time.time()
-    fps = 1.0 / (current_time - prev_time) if (current_time - prev_time) > 0 else 0
+    dt = current_time - prev_time
+    fps = 1.0 / dt if dt > 0 else 0
     prev_time = current_time
 
-    # Apply Light / Brightness adjustment if requested
     if brightness_boost != 0:
         frame = cv2.convertScaleAbs(frame, alpha=1.0, beta=brightness_boost)
 
     h, w, _ = frame.shape
+    cx_cam = w / 2.0
+    cy_cam = h / 2.0
+    FOCAL_LENGTH_PX = (w / 1920.0) * 1150.0  # Dynamic focal length scaling
+
     conf_threshold = conf_percent / 100.0
 
-    # Run YOLO with ByteTrack tracker at FULL HIGH-RESOLUTION (imgsz=1280)
-    # This prevents distant/small drones from being downscaled and blurred out
+    # High-Resolution YOLO Inference
     results = model.track(
         frame,
         persist=True,
@@ -138,6 +212,7 @@ while True:
     )
 
     confirmed_drone_count = 0
+    telemetry_records = []  # Digital Twin telemetry stream container
 
     for result in results:
         boxes = result.boxes
@@ -148,7 +223,6 @@ while True:
             cls_id = int(box.cls[0])
             confidence = float(box.conf[0])
 
-            # STRICT CLASS FILTER: Only drone class
             if cls_id != DRONE_CLASS_ID or confidence < conf_threshold:
                 continue
 
@@ -156,130 +230,170 @@ while True:
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             box_w, box_h = (x2 - x1), (y2 - y1)
 
-            # Filter out impossibly large non-drone objects (e.g. a moving laptop or person occupying > 40% of the screen)
-            box_area = box_w * box_h
-            if box_area > (0.40 * w * h):
+            # Filter massive screen-filling objects (laptops, humans right against lens)
+            if (box_w * box_h) > (0.40 * w * h):
                 continue
 
-            # Anti-Glitch Temporal Filter:
-            # Requires persistent tracking across consecutive frames so random motion/moving objects don't trigger for a split second
-            is_confirmed = False
-            if track_id is not None:
-                track_hits[track_id] = track_hits.get(track_id, 0) + 1
-                track_last_seen[track_id] = frame_count
+            # Anti-glitch persistence
+            if track_id is None:
+                continue
 
-                # Require at least 3 consecutive frames to eliminate 1-2 frame motion glitches
-                if track_hits[track_id] >= 3:
-                    is_confirmed = True
-                elif track_hits[track_id] >= 2 and confidence >= 0.65:
-                    is_confirmed = True
-            else:
-                # Untracked single-frame spikes are ignored to eliminate motion flicker
-                pass
+            if track_id not in tracks_db:
+                tracks_db[track_id] = TargetKinematics(track_id)
+            
+            target_kin = tracks_db[track_id]
 
-            if is_confirmed:
+            # Compute Monocular Distance & CRLB
+            z_est, sigma_d, ci_low, ci_high, crlb_var = compute_crlb_distance(
+                box_w, box_h, target_nominal_width, FOCAL_LENGTH_PX, SIGMA_PIXEL
+            )
+
+            # 3D Coordinates relative to camera optical axis
+            u_center = (x1 + x2) / 2.0
+            v_center = (y1 + y2) / 2.0
+            x_3d = ((u_center - cx_cam) * z_est) / FOCAL_LENGTH_PX
+            y_3d = ((v_center - cy_cam) * z_est) / FOCAL_LENGTH_PX
+
+            target_kin.update(frame_count, current_time, x_3d, y_3d, z_est, sigma_d)
+
+            # Require persistent confirmation (3 frames)
+            if target_kin.hits >= MIN_CONSECUTIVE_FRAMES or (target_kin.hits >= 2 and confidence >= 0.65):
                 confirmed_drone_count += 1
+                disp_z = target_kin.smoothed_z if target_kin.smoothed_z is not None else z_est
 
-                # Target Alert Bounding Box (High-contrast Red with corner reticle)
-                box_color = (0, 0, 255)
+                # Record Telemetry for Digital Twin
+                telemetry_records.append({
+                    "track_id": track_id,
+                    "confidence": confidence,
+                    "position_3d": [x_3d, y_3d, disp_z],
+                    "crlb_sigma": sigma_d,
+                    "velocity_3d": target_kin.velocity_3d,
+                    "speed_kmh": target_kin.speed_kmh,
+                    "approach_rate": target_kin.approach_rate,
+                    "eta_s": target_kin.eta_seconds,
+                    "bbox": [x1, y1, x2, y2]
+                })
+
+                # Threat Zone Color Coding by Distance
+                if disp_z < 10.0:
+                    box_color = (0, 0, 255)       # Red: Critical Proximity
+                    zone_str = "CRITICAL"
+                elif disp_z < 25.0:
+                    box_color = (0, 165, 255)     # Orange: Tactical Range
+                    zone_str = "CAUTION"
+                else:
+                    box_color = (0, 255, 0)       # Green: Long Range
+                    zone_str = "TRACKING"
+
+                # Draw Target Box & Corner Reticles
                 cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
-
-                # Corner crosshair brackets
                 corner_len = max(8, min(24, box_w // 3, box_h // 3))
-                # Top-Left
                 cv2.line(frame, (x1, y1), (x1 + corner_len, y1), (0, 255, 255), 3)
                 cv2.line(frame, (x1, y1), (x1, y1 + corner_len), (0, 255, 255), 3)
-                # Top-Right
                 cv2.line(frame, (x2, y1), (x2 - corner_len, y1), (0, 255, 255), 3)
                 cv2.line(frame, (x2, y1), (x2, y1 + corner_len), (0, 255, 255), 3)
-                # Bottom-Left
                 cv2.line(frame, (x1, y2), (x1 + corner_len, y2), (0, 255, 255), 3)
                 cv2.line(frame, (x1, y2), (x1, y2 - corner_len), (0, 255, 255), 3)
-                # Bottom-Right
                 cv2.line(frame, (x2, y2), (x2 - corner_len, y2), (0, 255, 255), 3)
-                cv2.line(frame, (x2, y2), (x2, y2 - corner_len), (0, 255, 255), 3)
+                cv2.line(frame, (x2, y2), (x2 - corner_len, y2), (0, 255, 255), 3)
 
-                # Center reticle dot for long-distance spot identification
-                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-                cv2.circle(frame, (cx, cy), 3, (0, 255, 255), -1)
+                # Center Reticle Target Point
+                cv2.circle(frame, (int(u_center), int(v_center)), 4, (0, 255, 255), -1)
 
-                # Label Badge
-                track_str = f"ID:{track_id} | " if track_id is not None else ""
-                dist_str = " (DISTANT)" if max(box_w, box_h) < 65 else ""
-                label = f"DRONE {track_str}{confidence * 100:.1f}%{dist_str}"
-                (label_w, label_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 2)
-                label_y1 = max(y1 - label_h - 10, 0)
-                label_y2 = y1
+                # --- MULTI-LINE TACTICAL HUD BADGE ---
+                line1 = f"DRONE [ID:{track_id}] {confidence*100:.0f}% | {zone_str}"
+                line2 = f"DIST: {disp_z:.1f}m [CRLB: +/-{sigma_d:.2f}m (2sigma: {ci_low:.1f}-{ci_high:.1f}m)]"
+                
+                # Approach vector text
+                if target_kin.approach_rate > 0.8:
+                    eta_str = f"ETA: {target_kin.eta_seconds:.1f}s" if target_kin.eta_seconds else ""
+                    line3 = f"VEL: {target_kin.speed_kmh:.1f}km/h (CLOSING @ +{target_kin.approach_rate:.1f}m/s {eta_str})"
+                    line3_color = (0, 255, 255)
+                elif target_kin.approach_rate < -0.8:
+                    line3 = f"VEL: {target_kin.speed_kmh:.1f}km/h (RECEDING @ {target_kin.approach_rate:.1f}m/s)"
+                    line3_color = (180, 255, 180)
+                else:
+                    line3 = f"VEL: {target_kin.speed_kmh:.1f}km/h (HOVER / LATERAL)"
+                    line3_color = (220, 220, 220)
 
-                cv2.rectangle(frame, (x1, label_y1), (x1 + label_w + 10, label_y2), (0, 0, 200), -1)
-                cv2.putText(frame, label, (x1 + 5, label_y2 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 2, cv2.LINE_AA)
+                badge_w = max(320, int(box_w + 80))
+                badge_h = 58
+                badge_y1 = max(0, y1 - badge_h - 6)
+                badge_y2 = y1 - 6
 
-    # Clean up stale tracks
-    stale_tracks = [tid for tid, last_f in track_last_seen.items() if frame_count - last_f > MAX_MISSED_FRAMES]
-    for tid in stale_tracks:
-        track_hits.pop(tid, None)
-        track_last_seen.pop(tid, None)
+                # Semi-transparent HUD overlay
+                overlay = frame.copy()
+                cv2.rectangle(overlay, (x1, badge_y1), (x1 + badge_w, badge_y2), (20, 20, 20), -1)
+                cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)
+                cv2.rectangle(frame, (x1, badge_y1), (x1 + badge_w, badge_y2), box_color, 1)
 
-    # --- TOP HUD HEADER ---
-    hud_bg_color = (0, 0, 180) if confirmed_drone_count > 0 else (35, 35, 35)
-    cv2.rectangle(frame, (0, 0), (w, 42), hud_bg_color, -1)
+                cv2.putText(frame, line1, (x1 + 6, badge_y1 + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (255, 255, 255), 1, cv2.LINE_AA)
+                cv2.putText(frame, line2, (x1 + 6, badge_y1 + 33), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1, cv2.LINE_AA)
+                cv2.putText(frame, line3, (x1 + 6, badge_y1 + 50), cv2.FONT_HERSHEY_SIMPLEX, 0.40, line3_color, 1, cv2.LINE_AA)
 
-    status_text = f"ALERT: {confirmed_drone_count} DRONE(S) DETECTED" if confirmed_drone_count > 0 else "SCANNING AIRSPACE: CLEAR (1280px HI-RES)"
-    status_color = (0, 255, 255) if confirmed_drone_count > 0 else (0, 255, 0)
-    cv2.putText(frame, status_text, (15, 28), cv2.FONT_HERSHEY_DUPLEX, 0.65, status_color, 2, cv2.LINE_AA)
+    # Stale track cleanup
+    stale_ids = [tid for tid, obj in tracks_db.items() if frame_count - obj.last_frame > MAX_MISSED_FRAMES]
+    for tid in stale_ids:
+        del tracks_db[tid]
 
-    fps_text = f"FPS: {fps:.1f} | Res: {w}x{h} | Light: {'+' if brightness_boost>=0 else ''}{brightness_boost}"
-    (tw, th), _ = cv2.getTextSize(fps_text, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)
-    cv2.putText(frame, fps_text, (w - tw - 15, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (220, 220, 220), 1, cv2.LINE_AA)
+    # ---------------------------------------------------------
+    # 6. TOP HEADER TELEMETRY BAR
+    # ---------------------------------------------------------
+    header_color = (0, 0, 180) if confirmed_drone_count > 0 else (30, 30, 30)
+    cv2.rectangle(frame, (0, 0), (w, 42), header_color, -1)
+    status_msg = f"AIRSPACE ALERT: {confirmed_drone_count} ACTIVE TARGET(S)" if confirmed_drone_count > 0 else "AIRSPACE SURVEILLANCE: SCANNING (CRLB ACTIVE)"
+    cv2.putText(frame, status_msg, (15, 28), cv2.FONT_HERSHEY_DUPLEX, 0.65, (0, 255, 255) if confirmed_drone_count > 0 else (0, 255, 0), 2, cv2.LINE_AA)
 
-    # --- BOTTOM HUD FOOTER (Interactive Sensitivity Bar) ---
-    footer_h = 44
-    cv2.rectangle(frame, (0, h - footer_h), (w, h), (25, 25, 25), -1)
+    profile_name = DRONE_PROFILES[active_profile_id]["name"]
+    header_right = f"Target Ref: {profile_name} ({target_nominal_width*100:.0f}cm) | FPS: {fps:.1f}"
+    (rw, _), _ = cv2.getTextSize(header_right, cv2.FONT_HERSHEY_SIMPLEX, 0.46, 1)
+    cv2.putText(frame, header_right, (w - rw - 15, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (220, 220, 220), 1, cv2.LINE_AA)
+
+    # ---------------------------------------------------------
+    # 7. BOTTOM TACTICAL FOOTER HUD (Sensitivity & CRLB Controls)
+    # ---------------------------------------------------------
+    footer_h = 46
+    cv2.rectangle(frame, (0, h - footer_h), (w, h), (20, 20, 20), -1)
     cv2.line(frame, (0, h - footer_h), (w, h - footer_h), (60, 60, 60), 1)
 
-    cv2.putText(frame, "SENSITIVITY:", (15, h - 16), cv2.FONT_HERSHEY_DUPLEX, 0.52, (200, 200, 200), 1, cv2.LINE_AA)
+    cv2.putText(frame, "SENSITIVITY:", (15, h - 16), cv2.FONT_HERSHEY_DUPLEX, 0.50, (200, 200, 200), 1, cv2.LINE_AA)
 
     SLIDER_X1 = 145
-    SLIDER_X2 = min(w - 280, 520)
-    SLIDER_Y1 = h - 28
-    SLIDER_Y2 = h - 14
+    SLIDER_X2 = min(w - 480, 520)
+    SLIDER_Y1 = h - 30
+    SLIDER_Y2 = h - 16
 
-    cv2.rectangle(frame, (SLIDER_X1, SLIDER_Y1), (SLIDER_X2, SLIDER_Y2), (55, 55, 55), -1)
-
+    cv2.rectangle(frame, (SLIDER_X1, SLIDER_Y1), (SLIDER_X2, SLIDER_Y2), (50, 50, 50), -1)
     fill_ratio = (conf_percent - 10) / 85.0
     fill_x = int(SLIDER_X1 + fill_ratio * (SLIDER_X2 - SLIDER_X1))
     fill_color = (0, 165, 255) if conf_percent > 45 else (0, 220, 100)
     cv2.rectangle(frame, (SLIDER_X1, SLIDER_Y1), (fill_x, SLIDER_Y2), fill_color, -1)
+    cv2.circle(frame, (fill_x, (SLIDER_Y1 + SLIDER_Y2) // 2), 7, (255, 255, 255), -1)
+    cv2.circle(frame, (fill_x, (SLIDER_Y1 + SLIDER_Y2) // 2), 8, (0, 140, 255), 2)
 
-    cv2.circle(frame, (fill_x, (SLIDER_Y1 + SLIDER_Y2) // 2), 8, (255, 255, 255), -1)
-    cv2.circle(frame, (fill_x, (SLIDER_Y1 + SLIDER_Y2) // 2), 9, (0, 140, 255), 2)
+    cv2.putText(frame, f"{conf_percent}%", (SLIDER_X2 + 12, h - 17), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 1, cv2.LINE_AA)
 
-    conf_label = f"{conf_percent}%"
-    cv2.putText(frame, conf_label, (SLIDER_X2 + 15, h - 16), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
+    # Key helpers & Profile selector prompt
+    controls_msg = "Profiles [1:Mini | 2:Std | 3:Hvy | 4:Wing] | Sens: [ / ] | Light: B | Quit: Q"
+    (cw, _), _ = cv2.getTextSize(controls_msg, cv2.FONT_HERSHEY_SIMPLEX, 0.40, 1)
+    cv2.putText(frame, controls_msg, (w - cw - 15, h - 17), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (180, 180, 180), 1, cv2.LINE_AA)
 
-    hint_text = "Adjust: [ / ] or Click Bar | Light: B | Quit: Q"
-    (hw, _), _ = cv2.getTextSize(hint_text, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)
-    cv2.putText(frame, hint_text, (w - hw - 15, h - 16), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 180), 1, cv2.LINE_AA)
-
-    # Display result
     cv2.imshow(WINDOW_NAME, frame)
 
-    # Keyboard Controls
+    # ---------------------------------------------------------
+    # 8. KEYBOARD COMMAND DISPATCHER
+    # ---------------------------------------------------------
     key = cv2.waitKey(1) & 0xFF
     if key in (ord("q"), ord("Q"), 27):
         break
+    elif key in (ord("1"), ord("2"), ord("3"), ord("4")):
+        active_profile_id = int(chr(key))
+        target_nominal_width = DRONE_PROFILES[active_profile_id]["width"]
+        print(f"[*] Switched Drone Size Profile: {DRONE_PROFILES[active_profile_id]['desc']}")
     elif key in (ord("+"), ord("="), ord("]"), 0, 82):
         conf_percent = min(95, conf_percent + 5)
-        try:
-            cv2.setTrackbarPos("Conf (%)", WINDOW_NAME, conf_percent)
-        except Exception:
-            pass
     elif key in (ord("-"), ord("_"), ord("["), 1, 84):
         conf_percent = max(10, conf_percent - 5)
-        try:
-            cv2.setTrackbarPos("Conf (%)", WINDOW_NAME, conf_percent)
-        except Exception:
-            pass
     elif key in (ord("b"),):
         brightness_boost = (brightness_boost + 15) if brightness_boost < 60 else -30
     elif key in (ord("B"),):
@@ -287,6 +401,7 @@ while True:
 
 cap.release()
 cv2.destroyAllWindows()
+
 
 
 
