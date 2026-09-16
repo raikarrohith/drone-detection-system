@@ -6,6 +6,7 @@ import argparse
 import cv2
 import numpy as np
 from ultralytics import YOLO
+from drone_classifier import DroneTypeClassifier
 
 # ---------------------------------------------------------
 # 1. PARSE ARGUMENTS & LOAD YOLO MODEL
@@ -19,6 +20,8 @@ parser = argparse.ArgumentParser(description="Drone Defense & CRLB Distance Esti
 parser.add_argument("--video", "-v", type=str, default=None, help="Path to test video file (e.g. drone_test.mp4)")
 parser.add_argument("--camera", "-c", type=int, default=None, help="Camera index (e.g. 0, 1, 2)")
 parser.add_argument("--imgsz", type=int, default=960, help="Inference resolution: 960 (balanced long-range) or 1280/640")
+parser.add_argument("--type-model", type=str, default="models/drone_type_classifier.pt", help="Optional civilian/military Ultralytics classification model")
+parser.add_argument("--type-confidence", type=float, default=0.70, help="Minimum drone-type classifier confidence (0-1)")
 parser.add_argument("video_pos", nargs="?", default=None, help="Positional video file path")
 args, _ = parser.parse_known_args()
 
@@ -40,6 +43,11 @@ else:
 
 MODEL_PATH = "models/best.pt"
 model = YOLO(MODEL_PATH)
+type_classifier = DroneTypeClassifier(args.type_model, args.type_confidence)
+if type_classifier.enabled:
+    print(f"[*] Drone Type Classifier: {args.type_model} (threshold {args.type_confidence:.0%})")
+else:
+    print("[*] Drone Type Classifier: unavailable; detections will be labeled UNKNOWN")
 
 DRONE_CLASS_ID = 0
 for cls_id, name in model.names.items():
@@ -162,6 +170,17 @@ class TargetKinematics:
         self.speed_kmh = 0.0
         self.approach_rate = 0.0  # m/s (+ approaching, - receding)
         self.eta_seconds = None
+        self.type_votes = {"CIVILIAN": 0.0, "MILITARY": 0.0}
+
+    def update_type(self, label, confidence):
+        """Smooth classifications over a track to avoid frame-to-frame flicker."""
+        for known_label in self.type_votes:
+            self.type_votes[known_label] *= 0.90
+        if label in self.type_votes:
+            self.type_votes[label] += confidence
+
+        label, score = max(self.type_votes.items(), key=lambda item: item[1])
+        return (label, score) if score >= 1.0 else ("UNKNOWN", 0.0)
 
     def update(self, frame_num, timestamp, x_m, y_m, z_m, sigma_d):
         self.hits += 1
@@ -348,6 +367,12 @@ while True:
 
             target_kin.update(frame_count, current_time, x_3d, y_3d, z_est, sigma_d)
 
+            # Crop the detected aircraft, then classify it with the optional
+            # type-specific model. The detector itself only knows "drone".
+            crop = frame[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
+            frame_type, frame_type_conf = type_classifier.classify(crop, device=DEVICE)
+            drone_type, drone_type_score = target_kin.update_type(frame_type, frame_type_conf)
+
             # Require persistent confirmation (1-2 frames or confidence >= 0.20)
             if target_kin.hits >= MIN_CONSECUTIVE_FRAMES or confidence >= 0.20:
                 confirmed_drone_count += 1
@@ -363,6 +388,8 @@ while True:
                     "speed_kmh": target_kin.speed_kmh,
                     "approach_rate": target_kin.approach_rate,
                     "eta_s": target_kin.eta_seconds,
+                    "drone_type": drone_type.lower(),
+                    "drone_type_confidence": drone_type_score,
                     "bbox": [x1, y1, x2, y2]
                 })
 
@@ -404,6 +431,8 @@ while True:
                     ci_str = f"{ci_low:.1f}-{ci_high:.1f}m"
                     
                 line2 = f"DIST: {disp_z:.2f}m [CRLB: {err_str} (95% CI: {ci_str})]"
+                type_confidence_text = f" {drone_type_score:.0%}" if drone_type != "UNKNOWN" else ""
+                line2 = f"TYPE: {drone_type}{type_confidence_text} | " + line2
                 
                 # Approach vector text
                 if target_kin.approach_rate > 0.8:
