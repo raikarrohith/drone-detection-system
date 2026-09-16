@@ -1,5 +1,7 @@
+import sys
 import time
 import cv2
+import numpy as np
 from ultralytics import YOLO
 
 # 1. Load fine-tuned drone detector model
@@ -13,39 +15,75 @@ for cls_id, name in model.names.items():
         DRONE_CLASS_ID = cls_id
         break
 
-# 2. Camera Setup (Use DirectShow on Windows for reliable, instant feed)
-CAMERA_INDEX = 0
-cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
-if not cap.isOpened():
-    cap = cv2.VideoCapture(CAMERA_INDEX)
+# 2. Cross-Platform Camera Setup (DirectShow for Windows, AVFoundation for macOS)
+cap = None
+is_windows = sys.platform.startswith("win")
+backend = cv2.CAP_DSHOW if is_windows else cv2.CAP_ANY
 
-if not cap.isOpened():
-    # Try index 1 if 0 is unavailable
-    cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)
-    if not cap.isOpened():
-        cap = cv2.VideoCapture(1)
+for cam_idx in [0, 1, 2]:
+    temp_cap = cv2.VideoCapture(cam_idx, backend)
+    if not temp_cap.isOpened():
+        temp_cap = cv2.VideoCapture(cam_idx)
+    if temp_cap.isOpened():
+        cap = temp_cap
+        break
 
-if not cap.isOpened():
-    print(f"ERROR: Could not open camera (tried indices 0 and 1)")
+if cap is None or not cap.isOpened():
+    print("ERROR: Could not open camera (tried indices 0, 1, and 2)")
     exit(1)
 
-# Set resolution for crisp performance
+# Set resolution
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
-# Window & Trackbar configuration for real-time calibration
 WINDOW_NAME = "Drone Detection System"
-cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
+cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
 
-def nothing(x):
+# Real-time state (independent of OS highgui trackbar)
+conf_percent = 55
+brightness_boost = 0  # Light sensitivity / brightness compensation (-50 to +50)
+dragging_slider = False
+
+# Try native trackbar for systems that support it (Windows/Qt)
+def on_trackbar(val):
+    global conf_percent
+    conf_percent = max(15, min(95, val))
+
+try:
+    cv2.createTrackbar("Conf (%)", WINDOW_NAME, conf_percent, 95, on_trackbar)
+except Exception:
     pass
 
-# Start with a strict 55% default confidence to filter out random motion/objects
-DEFAULT_CONF_PERCENT = 55
-cv2.createTrackbar("Conf Threshold (%)", WINDOW_NAME, DEFAULT_CONF_PERCENT, 95, nothing)
+# Slider layout configuration for On-Screen HUD (OSD)
+SLIDER_X1 = 200
+SLIDER_X2 = 600
+SLIDER_Y1 = 0  # Calculated dynamically based on frame height
+SLIDER_Y2 = 0
+
+def handle_mouse(event, x, y, flags, param):
+    global conf_percent, dragging_slider, SLIDER_X1, SLIDER_X2, SLIDER_Y1, SLIDER_Y2
+    if event == cv2.EVENT_LBUTTONDOWN:
+        if SLIDER_X1 - 15 <= x <= SLIDER_X2 + 15 and SLIDER_Y1 - 10 <= y <= SLIDER_Y2 + 10:
+            dragging_slider = True
+            norm_val = (x - SLIDER_X1) / max(1, (SLIDER_X2 - SLIDER_X1))
+            conf_percent = int(max(15, min(95, 15 + norm_val * 80)))
+            try:
+                cv2.setTrackbarPos("Conf (%)", WINDOW_NAME, conf_percent)
+            except Exception:
+                pass
+    elif event == cv2.EVENT_MOUSEMOVE and dragging_slider:
+        norm_val = (x - SLIDER_X1) / max(1, (SLIDER_X2 - SLIDER_X1))
+        conf_percent = int(max(15, min(95, 15 + norm_val * 80)))
+        try:
+            cv2.setTrackbarPos("Conf (%)", WINDOW_NAME, conf_percent)
+        except Exception:
+            pass
+    elif event == cv2.EVENT_LBUTTONUP:
+        dragging_slider = False
+
+cv2.setMouseCallback(WINDOW_NAME, handle_mouse)
 
 # Track persistence memory (track_id -> frame_hits)
-# Requires an object to persist across multiple frames before confirming as a Drone
 track_hits = {}
 MIN_CONSECUTIVE_FRAMES = 3
 MAX_MISSED_FRAMES = 10
@@ -54,11 +92,12 @@ track_last_seen = {}
 prev_time = time.time()
 frame_count = 0
 
-print("\n" + "=" * 50)
+print("\n" + "=" * 55)
 print("  DRONE DETECTION SYSTEM ACTIVATED")
-print("  - Adjust sensitivity with the Trackbar or [ / ] keys")
+print("  - Sensitivity Bar: Click/drag on-screen bar or use [ / ] keys")
+print("  - Light/Brightness: Press 'b' / 'B' to adjust light sensitivity")
 print("  - Press 'q' or ESC to exit")
-print("=" * 50 + "\n")
+print("=" * 55 + "\n")
 
 while True:
     ret, frame = cap.read()
@@ -71,13 +110,14 @@ while True:
     fps = 1.0 / (current_time - prev_time) if (current_time - prev_time) > 0 else 0
     prev_time = current_time
 
-    # Get current confidence threshold from trackbar
-    conf_trackbar = cv2.getTrackbarPos("Conf Threshold (%)", WINDOW_NAME)
-    # Ensure minimum confidence of at least 20%
-    conf_threshold = max(conf_trackbar, 20) / 100.0
+    # Apply Light / Brightness adjustment if set
+    if brightness_boost != 0:
+        frame = cv2.convertScaleAbs(frame, alpha=1.0, beta=brightness_boost)
+
+    h, w, _ = frame.shape
+    conf_threshold = conf_percent / 100.0
 
     # Run YOLO with ByteTrack tracker
-    # Low-confidence non-drone motion is filtered out before tracking
     results = model.track(
         frame,
         persist=True,
@@ -87,10 +127,7 @@ while True:
         verbose=False
     )
 
-    active_track_ids_in_frame = set()
     confirmed_drone_count = 0
-
-    h, w, _ = frame.shape
 
     for result in results:
         boxes = result.boxes
@@ -101,29 +138,21 @@ while True:
             cls_id = int(box.cls[0])
             confidence = float(box.conf[0])
 
-            # STRICT CLASS FILTER: Ignore anything that is not classified as a drone
-            if cls_id != DRONE_CLASS_ID:
+            # Filter: only drone class
+            if cls_id != DRONE_CLASS_ID or confidence < conf_threshold:
                 continue
 
-            # Confidence check against active threshold
-            if confidence < conf_threshold:
-                continue
-
-            # Track ID handling
             track_id = int(box.id[0]) if box.id is not None else None
             x1, y1, x2, y2 = map(int, box.xyxy[0])
 
-            # Temporal filtering: Require persistent track hits to avoid single-frame motion glitches
+            # Temporal filtering: Require persistent track hits
             is_confirmed = False
             if track_id is not None:
-                active_track_ids_in_frame.add(track_id)
                 track_hits[track_id] = track_hits.get(track_id, 0) + 1
                 track_last_seen[track_id] = frame_count
-
                 if track_hits[track_id] >= MIN_CONSECUTIVE_FRAMES or confidence >= 0.70:
                     is_confirmed = True
             else:
-                # If no tracker ID, require very high confidence to display
                 if confidence >= 0.65:
                     is_confirmed = True
 
@@ -131,114 +160,109 @@ while True:
                 confirmed_drone_count += 1
 
                 # Target Alert Bounding Box (Bright Red with corner accents)
-                box_color = (0, 0, 255)  # Red BGR
+                box_color = (0, 0, 255)
                 cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
 
-                # Corner brackets for modern HUD look
                 corner_len = min(20, (x2 - x1) // 4, (y2 - y1) // 4)
                 if corner_len > 0:
-                    # Top-Left
                     cv2.line(frame, (x1, y1), (x1 + corner_len, y1), (0, 255, 255), 3)
                     cv2.line(frame, (x1, y1), (x1, y1 + corner_len), (0, 255, 255), 3)
-                    # Top-Right
                     cv2.line(frame, (x2, y1), (x2 - corner_len, y1), (0, 255, 255), 3)
                     cv2.line(frame, (x2, y1), (x2, y1 + corner_len), (0, 255, 255), 3)
-                    # Bottom-Left
                     cv2.line(frame, (x1, y2), (x1 + corner_len, y2), (0, 255, 255), 3)
                     cv2.line(frame, (x1, y2), (x1, y2 - corner_len), (0, 255, 255), 3)
-                    # Bottom-Right
                     cv2.line(frame, (x2, y2), (x2 - corner_len, y2), (0, 255, 255), 3)
                     cv2.line(frame, (x2, y2), (x2, y2 - corner_len), (0, 255, 255), 3)
 
-                # Label Badge
                 track_str = f"ID:{track_id} | " if track_id is not None else ""
                 label = f"DRONE {track_str}{confidence * 100:.1f}%"
-                
-                (label_w, label_h), baseline = cv2.getTextSize(
-                    label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2
-                )
-                
+                (label_w, label_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
                 label_y1 = max(y1 - label_h - 10, 0)
                 label_y2 = y1
-                
-                # Background badge
-                cv2.rectangle(
-                    frame,
-                    (x1, label_y1),
-                    (x1 + label_w + 10, label_y2),
-                    (0, 0, 200),
-                    -1
-                )
-                cv2.putText(
-                    frame,
-                    label,
-                    (x1 + 5, label_y2 - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.55,
-                    (255, 255, 255),
-                    2,
-                    cv2.LINE_AA
-                )
 
-    # Clean up stale tracks from memory
-    stale_tracks = [
-        tid for tid, last_frame in track_last_seen.items()
-        if frame_count - last_frame > MAX_MISSED_FRAMES
-    ]
+                cv2.rectangle(frame, (x1, label_y1), (x1 + label_w + 10, label_y2), (0, 0, 200), -1)
+                cv2.putText(frame, label, (x1 + 5, label_y2 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
+
+    # Clean up stale tracks
+    stale_tracks = [tid for tid, last_f in track_last_seen.items() if frame_count - last_f > MAX_MISSED_FRAMES]
     for tid in stale_tracks:
         track_hits.pop(tid, None)
         track_last_seen.pop(tid, None)
 
-    # HUD Status Bar (Top)
+    # --- TOP HUD HEADER ---
     hud_bg_color = (0, 0, 180) if confirmed_drone_count > 0 else (40, 40, 40)
-    cv2.rectangle(frame, (0, 0), (w, 45), hud_bg_color, -1)
+    cv2.rectangle(frame, (0, 0), (w, 42), hud_bg_color, -1)
 
-    if confirmed_drone_count > 0:
-        status_text = f"ALERT: {confirmed_drone_count} DRONE(S) DETECTED"
-        status_color = (0, 255, 255)
-    else:
-        status_text = "SCANNING: AIRSPACE CLEAR"
-        status_color = (0, 255, 0)
+    status_text = f"ALERT: {confirmed_drone_count} DRONE(S) DETECTED" if confirmed_drone_count > 0 else "SCANNING: AIRSPACE CLEAR"
+    status_color = (0, 255, 255) if confirmed_drone_count > 0 else (0, 255, 0)
+    cv2.putText(frame, status_text, (15, 28), cv2.FONT_HERSHEY_DUPLEX, 0.70, status_color, 2, cv2.LINE_AA)
 
-    cv2.putText(
-        frame,
-        status_text,
-        (15, 30),
-        cv2.FONT_HERSHEY_DUPLEX,
-        0.75,
-        status_color,
-        2,
-        cv2.LINE_AA
-    )
+    fps_text = f"FPS: {fps:.1f} | Brightness: {'+' if brightness_boost>=0 else ''}{brightness_boost}"
+    (tw, th), _ = cv2.getTextSize(fps_text, cv2.FONT_HERSHEY_SIMPLEX, 0.50, 1)
+    cv2.putText(frame, fps_text, (w - tw - 15, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (220, 220, 220), 1, cv2.LINE_AA)
 
-    # System telemetry info on right side of top bar
-    telemetry_text = f"Conf: {int(conf_threshold * 100)}% | FPS: {fps:.1f}"
-    (tw, th), _ = cv2.getTextSize(telemetry_text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
-    cv2.putText(
-        frame,
-        telemetry_text,
-        (w - tw - 15, 28),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.55,
-        (220, 220, 220),
-        1,
-        cv2.LINE_AA
-    )
+    # --- BOTTOM HUD FOOTER (Cross-Platform On-Screen Sensitivity Bar) ---
+    footer_h = 44
+    cv2.rectangle(frame, (0, h - footer_h), (w, h), (25, 25, 25), -1)
+    cv2.line(frame, (0, h - footer_h), (w, h - footer_h), (60, 60, 60), 1)
+
+    # Label on left
+    cv2.putText(frame, "SENSITIVITY:", (15, h - 16), cv2.FONT_HERSHEY_DUPLEX, 0.52, (200, 200, 200), 1, cv2.LINE_AA)
+
+    # Interactive slider coordinates
+    SLIDER_X1 = 145
+    SLIDER_X2 = min(w - 280, 520)
+    SLIDER_Y1 = h - 28
+    SLIDER_Y2 = h - 14
+
+    # Background track
+    cv2.rectangle(frame, (SLIDER_X1, SLIDER_Y1), (SLIDER_X2, SLIDER_Y2), (55, 55, 55), -1)
+
+    # Active filled track
+    fill_ratio = (conf_percent - 15) / 80.0
+    fill_x = int(SLIDER_X1 + fill_ratio * (SLIDER_X2 - SLIDER_X1))
+    fill_color = (0, 165, 255) if conf_percent > 50 else (0, 220, 100)
+    cv2.rectangle(frame, (SLIDER_X1, SLIDER_Y1), (fill_x, SLIDER_Y2), fill_color, -1)
+
+    # Handle / Knob
+    cv2.circle(frame, (fill_x, (SLIDER_Y1 + SLIDER_Y2) // 2), 8, (255, 255, 255), -1)
+    cv2.circle(frame, (fill_x, (SLIDER_Y1 + SLIDER_Y2) // 2), 9, (0, 140, 255), 2)
+
+    # Percentage Badge
+    conf_label = f"{conf_percent}%"
+    cv2.putText(frame, conf_label, (SLIDER_X2 + 15, h - 16), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
+
+    # Key helpers on right
+    hint_text = "Adjust: [ / ] or Click Bar | Light: B | Quit: Q"
+    (hw, _), _ = cv2.getTextSize(hint_text, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)
+    cv2.putText(frame, hint_text, (w - hw - 15, h - 16), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 180), 1, cv2.LINE_AA)
 
     # Display result
     cv2.imshow(WINDOW_NAME, frame)
 
     # Keyboard Controls
     key = cv2.waitKey(1) & 0xFF
-    if key in (ord("q"), ord("Q"), 27):  # 'q' or ESC to quit
+    if key in (ord("q"), ord("Q"), 27):
         break
-    elif key in (ord("+"), ord("="), ord("]")):
-        new_val = min(95, cv2.getTrackbarPos("Conf Threshold (%)", WINDOW_NAME) + 5)
-        cv2.setTrackbarPos("Conf Threshold (%)", WINDOW_NAME, new_val)
-    elif key in (ord("-"), ord("_"), ord("[")):
-        new_val = max(20, cv2.getTrackbarPos("Conf Threshold (%)", WINDOW_NAME) - 5)
-        cv2.setTrackbarPos("Conf Threshold (%)", WINDOW_NAME, new_val)
+    elif key in (ord("+"), ord("="), ord("]"), 0, 82):  # UP or + or ]
+        conf_percent = min(95, conf_percent + 5)
+        try:
+            cv2.setTrackbarPos("Conf (%)", WINDOW_NAME, conf_percent)
+        except Exception:
+            pass
+    elif key in (ord("-"), ord("_"), ord("["), 1, 84):  # DOWN or - or [
+        conf_percent = max(15, conf_percent - 5)
+        try:
+            cv2.setTrackbarPos("Conf (%)", WINDOW_NAME, conf_percent)
+        except Exception:
+            pass
+    elif key in (ord("b"),):
+        # Increase brightness / light compensation
+        brightness_boost = (brightness_boost + 15) if brightness_boost < 60 else -30
+    elif key in (ord("B"),):
+        brightness_boost = max(-50, brightness_boost - 15)
 
 cap.release()
 cv2.destroyAllWindows()
+
 
