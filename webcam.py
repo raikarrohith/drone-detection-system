@@ -184,29 +184,35 @@ def is_hollow_eyeglasses(crop_bgr):
 
 def is_human_or_face_false_positive(crop_bgr, aspect_ratio, confidence):
     """
-    Discriminates humans, faces, and nearby bodies from airborne drones.
-    - Faces and people have vertical elongation (aspect_ratio < 0.88).
-    - Skin-tone detection in YCrCb color space accurately detects human faces/hands/arms.
-    - Real multirotor drones have horizontal/square aspect ratios (>= 0.90) and non-skin materials.
+    Discriminates humans, faces, and moving heads/bodies from airborne drones.
+    - Dual HSV + YCrCb chrominance detects human skin across complexions and lighting.
+    - Rejects moving heads, faces, and nearby humans while preserving hand-held and flying drones.
     """
     if crop_bgr is None or crop_bgr.size == 0:
         return False
         
-    # 1. Reject purely vertical shapes (taller than wide) unless exceptionally high confidence
-    if aspect_ratio < 0.88 and confidence < 0.55:
+    # 1. Reject vertically elongated shapes (faces, standing/sitting humans) unless exceptionally high confidence
+    if aspect_ratio < 0.95 and confidence < 0.65:
         return True
         
-    # 2. Skin-tone analysis across human face/skin color ranges
+    # 2. Dual HSV + YCrCb Chromaticity Skin Analysis
+    hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
     ycrcb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2YCrCb)
-    skin_mask = cv2.inRange(ycrcb, np.array([0, 133, 77]), np.array([255, 173, 127]))
+    
+    mask_hsv1 = cv2.inRange(hsv, np.array([0, 25, 45]), np.array([25, 255, 255]))
+    mask_hsv2 = cv2.inRange(hsv, np.array([170, 25, 45]), np.array([180, 255, 255]))
+    mask_hsv = cv2.bitwise_or(mask_hsv1, mask_hsv2)
+    
+    mask_ycrcb = cv2.inRange(ycrcb, np.array([0, 130, 75]), np.array([255, 180, 135]))
+    skin_mask = cv2.bitwise_and(mask_hsv, mask_ycrcb)
     skin_ratio = np.count_nonzero(skin_mask) / max(1, skin_mask.size)
     
-    # Face / hand / person signature: vertical or square shape with > 18% skin tone
-    if aspect_ratio < 1.15 and skin_ratio > 0.18:
+    # Moving face / head / skin signature: contains > 12% skin tone
+    if skin_ratio > 0.12:
         return True
         
-    # General skin presence > 32% even if wide
-    if skin_ratio > 0.32:
+    # Low confidence on near-square object with any noticeable skin presence
+    if aspect_ratio < 1.25 and skin_ratio > 0.07 and confidence < 0.45:
         return True
         
     return False
