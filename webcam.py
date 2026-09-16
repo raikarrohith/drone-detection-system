@@ -306,11 +306,24 @@ while True:
             track_id = int(box.id[0]) if box.id is not None else None
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             box_w, box_h = (x2 - x1), (y2 - y1)
-            # Use characteristic dimension max(box_w, box_h) so rotated/tilted drones at any 3D angle are tracked accurately
+            aspect_ratio = float(box_w) / max(1.0, float(box_h))
             char_dim = max(box_w, box_h)
 
-            # Filter massive screen-filling objects (laptops, humans taking > 50% of entire screen)
-            if (box_w * box_h) > (0.50 * w * h):
+            # 1. Eyeglasses / Spectacles & Desktop Clutter Rejection Filter:
+            # - Multi-rotor drones (Profiles 1-3) have compact symmetric footprints (aspect ratio 0.65 - 1.75).
+            # - Eyeglasses/Spectacles have wide, elongated horizontal profiles (aspect ratio 1.85 - 3.8).
+            # - Filter out elongated clutter (specs, pens, keyboards) unless confidence is exceptionally high (> 0.50).
+            if active_profile_id != 4:  # For Multirotors (Mini 24cm, Standard 38cm, Heavy 75cm)
+                if (aspect_ratio > 1.80 or aspect_ratio < 0.45) and confidence < 0.48:
+                    continue
+                if aspect_ratio > 2.2:  # Strictly reject extreme wide shapes (glasses, bars)
+                    continue
+            else:  # Tactical Fixed-Wing Profile
+                if (aspect_ratio > 3.0 or aspect_ratio < 0.30) and confidence < 0.45:
+                    continue
+
+            # 2. Filter massive screen-filling objects (laptops, walls taking > 45% of screen)
+            if (box_w * box_h) > (0.45 * w * h):
                 continue
 
             # Anti-glitch persistence
