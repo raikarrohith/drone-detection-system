@@ -156,17 +156,26 @@ while True:
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             box_w, box_h = (x2 - x1), (y2 - y1)
 
-            # Distant / Small Target Detection Logic:
-            # Distant objects (small bounding box) get fast track lock to prevent distance drops
+            # Filter out impossibly large non-drone objects (e.g. a moving laptop or person occupying > 40% of the screen)
+            box_area = box_w * box_h
+            if box_area > (0.40 * w * h):
+                continue
+
+            # Anti-Glitch Temporal Filter:
+            # Requires persistent tracking across consecutive frames so random motion/moving objects don't trigger for a split second
             is_confirmed = False
             if track_id is not None:
                 track_hits[track_id] = track_hits.get(track_id, 0) + 1
                 track_last_seen[track_id] = frame_count
-                if track_hits[track_id] >= MIN_CONSECUTIVE_FRAMES or confidence >= 0.50:
+
+                # Require at least 3 consecutive frames to eliminate 1-2 frame motion glitches
+                if track_hits[track_id] >= 3:
+                    is_confirmed = True
+                elif track_hits[track_id] >= 2 and confidence >= 0.65:
                     is_confirmed = True
             else:
-                if confidence >= 0.40:
-                    is_confirmed = True
+                # Untracked single-frame spikes are ignored to eliminate motion flicker
+                pass
 
             if is_confirmed:
                 confirmed_drone_count += 1
