@@ -18,12 +18,13 @@ import torch
 parser = argparse.ArgumentParser(description="Drone Defense & CRLB Distance Estimation System")
 parser.add_argument("--video", "-v", type=str, default=None, help="Path to test video file (e.g. drone_test.mp4)")
 parser.add_argument("--camera", "-c", type=int, default=None, help="Camera index (e.g. 0, 1, 2)")
-parser.add_argument("--imgsz", type=int, default=640, help="Inference resolution: 640 (fastest/smoothest) or 960/1280 (long range)")
+parser.add_argument("--imgsz", type=int, default=960, help="Inference resolution: 960 (balanced long-range) or 1280/640")
 parser.add_argument("video_pos", nargs="?", default=None, help="Positional video file path")
 args, _ = parser.parse_known_args()
 
 video_source = args.video if args.video else args.video_pos
 current_imgsz = args.imgsz
+
 
 # Auto-detect best hardware device (NVIDIA CUDA, Apple Silicon MPS, or multi-threaded CPU)
 if torch.cuda.is_available():
@@ -196,11 +197,11 @@ class TargetKinematics:
                     self.eta_seconds = None
 
 tracks_db = {}
-MIN_CONSECUTIVE_FRAMES = 3
-MAX_MISSED_FRAMES = 15
+MIN_CONSECUTIVE_FRAMES = 2  # Responsive confirmation for distant mini drones
+MAX_MISSED_FRAMES = 20      # Maintain track lock even if drone banks or flies far away
 
-# UI State
-conf_percent = 35
+# UI State (Default 25% for high-sensitivity long-range detection)
+conf_percent = 25
 brightness_boost = 0
 dragging_slider = False
 SLIDER_X1, SLIDER_X2, SLIDER_Y1, SLIDER_Y2 = 145, 520, 0, 0
@@ -266,12 +267,12 @@ while True:
 
     conf_threshold = conf_percent / 100.0
 
-    # Hardware-Accelerated YOLO Inference
+    # Hardware-Accelerated YOLO Inference with Multi-Stage Track Association
     results = model.track(
         frame,
         persist=True,
         tracker="bytetrack.yaml",
-        conf=conf_threshold,
+        conf=max(0.12, conf_threshold * 0.80),
         iou=0.45,
         imgsz=current_imgsz,
         device=DEVICE,
@@ -290,7 +291,7 @@ while True:
             cls_id = int(box.cls[0])
             confidence = float(box.conf[0])
 
-            if cls_id != DRONE_CLASS_ID or confidence < conf_threshold:
+            if cls_id != DRONE_CLASS_ID or confidence < (conf_threshold * 0.90):
                 continue
 
             track_id = int(box.id[0]) if box.id is not None else None
@@ -325,8 +326,8 @@ while True:
 
             target_kin.update(frame_count, current_time, x_3d, y_3d, z_est, sigma_d)
 
-            # Require persistent confirmation (3 frames)
-            if target_kin.hits >= MIN_CONSECUTIVE_FRAMES or (target_kin.hits >= 2 and confidence >= 0.65):
+            # Require persistent confirmation (2 frames or confidence >= 0.40)
+            if target_kin.hits >= MIN_CONSECUTIVE_FRAMES or confidence >= 0.40:
                 confirmed_drone_count += 1
                 disp_z = target_kin.smoothed_z if target_kin.smoothed_z is not None else z_est
 
