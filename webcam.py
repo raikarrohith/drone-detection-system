@@ -1,13 +1,23 @@
 import sys
+import os
 import time
 import math
+import argparse
 import cv2
 import numpy as np
 from ultralytics import YOLO
 
 # ---------------------------------------------------------
-# 1. LOAD FINE-TUNED DRONE DETECTOR MODEL
+# 1. PARSE ARGUMENTS & LOAD YOLO MODEL
 # ---------------------------------------------------------
+parser = argparse.ArgumentParser(description="Drone Defense & CRLB Distance Estimation System")
+parser.add_argument("--video", "-v", type=str, default=None, help="Path to test video file (e.g. drone_test.mp4)")
+parser.add_argument("--camera", "-c", type=int, default=None, help="Camera index (e.g. 0, 1, 2)")
+parser.add_argument("video_pos", nargs="?", default=None, help="Positional video file path")
+args, _ = parser.parse_known_args()
+
+video_source = args.video if args.video else args.video_pos
+
 MODEL_PATH = "models/best.pt"
 model = YOLO(MODEL_PATH)
 
@@ -18,33 +28,49 @@ for cls_id, name in model.names.items():
         break
 
 # ---------------------------------------------------------
-# 2. CAMERA SETUP & SENSOR CALIBRATION PARAMETERS
+# 2. SOURCE SETUP (Video File vs Live External/Internal Camera)
 # ---------------------------------------------------------
 cap = None
-is_windows = sys.platform.startswith("win")
-backend = cv2.CAP_DSHOW if is_windows else cv2.CAP_ANY
+is_video_file = False
+video_filename = ""
+is_paused = False
 
-for cam_idx in [1, 2, 0, 3]:
-    temp_cap = cv2.VideoCapture(cam_idx, backend)
-    if not temp_cap.isOpened():
-        temp_cap = cv2.VideoCapture(cam_idx)
-    if temp_cap.isOpened():
-        ret, test_frame = temp_cap.read()
-        if ret and test_frame is not None:
-            cap = temp_cap
-            print(f"[*] Successfully connected to camera (index {cam_idx})")
-            break
-        else:
-            temp_cap.release()
+if video_source and os.path.isfile(video_source):
+    cap = cv2.VideoCapture(video_source)
+    if cap.isOpened():
+        is_video_file = True
+        video_filename = os.path.basename(video_source)
+        print(f"[*] Testing with Video File: {video_source}")
+    else:
+        print(f"ERROR: Could not open video file {video_source}")
 
 if cap is None or not cap.isOpened():
-    print("ERROR: Could not open camera. Please check camera connections.")
+    is_windows = sys.platform.startswith("win")
+    backend = cv2.CAP_DSHOW if is_windows else cv2.CAP_ANY
+
+    target_cams = [args.camera] if args.camera is not None else [1, 2, 0, 3]
+    for cam_idx in target_cams:
+        temp_cap = cv2.VideoCapture(cam_idx, backend)
+        if not temp_cap.isOpened():
+            temp_cap = cv2.VideoCapture(cam_idx)
+        if temp_cap.isOpened():
+            ret, test_frame = temp_cap.read()
+            if ret and test_frame is not None:
+                cap = temp_cap
+                print(f"[*] Successfully connected to Live Camera (index {cam_idx})")
+                break
+            else:
+                temp_cap.release()
+
+if cap is None or not cap.isOpened():
+    print("ERROR: Could not open camera or video file. Please check connections or video path.")
     exit(1)
 
 # Set high resolution
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
-cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)
+if not is_video_file:
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+    cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)
 
 WINDOW_NAME = "Drone Defense System - CRLB Range & Kinematics Engine"
 cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
@@ -178,11 +204,22 @@ print("=" * 65 + "\n")
 # ---------------------------------------------------------
 # 5. MAIN REAL-TIME ESTIMATION & TRACKING LOOP
 # ---------------------------------------------------------
+current_frame = None
+
 while True:
-    ret, frame = cap.read()
-    if not ret:
-        print("ERROR: Could not read frame from camera.")
-        break
+    if not is_paused or current_frame is None:
+        ret, frame = cap.read()
+        if not ret:
+            if is_video_file:
+                # Auto-loop video file when it reaches the end
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ret, frame = cap.read()
+            if not ret:
+                print("End of video or could not read frame.")
+                break
+        current_frame = frame.copy()
+    else:
+        frame = current_frame.copy()
 
     frame_count += 1
     current_time = time.time()
@@ -295,7 +332,7 @@ while True:
                 cv2.line(frame, (x1, y2), (x1 + corner_len, y2), (0, 255, 255), 3)
                 cv2.line(frame, (x1, y2), (x1, y2 - corner_len), (0, 255, 255), 3)
                 cv2.line(frame, (x2, y2), (x2 - corner_len, y2), (0, 255, 255), 3)
-                cv2.line(frame, (x2, y2), (x2 - corner_len, y2), (0, 255, 255), 3)
+                cv2.line(frame, (x2, y2), (x2, y2 - corner_len), (0, 255, 255), 3)
 
                 # Center Reticle Target Point
                 cv2.circle(frame, (int(u_center), int(v_center)), 4, (0, 255, 255), -1)
@@ -341,11 +378,14 @@ while True:
     # ---------------------------------------------------------
     header_color = (0, 0, 180) if confirmed_drone_count > 0 else (30, 30, 30)
     cv2.rectangle(frame, (0, 0), (w, 42), header_color, -1)
+    
     status_msg = f"AIRSPACE ALERT: {confirmed_drone_count} ACTIVE TARGET(S)" if confirmed_drone_count > 0 else "AIRSPACE SURVEILLANCE: SCANNING (CRLB ACTIVE)"
     cv2.putText(frame, status_msg, (15, 28), cv2.FONT_HERSHEY_DUPLEX, 0.65, (0, 255, 255) if confirmed_drone_count > 0 else (0, 255, 0), 2, cv2.LINE_AA)
 
     profile_name = DRONE_PROFILES[active_profile_id]["name"]
-    header_right = f"Target Ref: {profile_name} ({target_nominal_width*100:.0f}cm) | FPS: {fps:.1f}"
+    source_tag = f"VID: {video_filename}" if is_video_file else f"Ref: {profile_name} ({target_nominal_width*100:.0f}cm)"
+    pause_tag = " [PAUSED]" if is_paused else ""
+    header_right = f"{source_tag}{pause_tag} | FPS: {fps:.1f}"
     (rw, _), _ = cv2.getTextSize(header_right, cv2.FONT_HERSHEY_SIMPLEX, 0.46, 1)
     cv2.putText(frame, header_right, (w - rw - 15, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (220, 220, 220), 1, cv2.LINE_AA)
 
@@ -374,7 +414,11 @@ while True:
     cv2.putText(frame, f"{conf_percent}%", (SLIDER_X2 + 12, h - 17), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 1, cv2.LINE_AA)
 
     # Key helpers & Profile selector prompt
-    controls_msg = "Profiles [1:Mini | 2:Std | 3:Hvy | 4:Wing] | Sens: [ / ] | Light: B | Quit: Q"
+    if is_video_file:
+        controls_msg = "Profiles [1-4] | [SPACE]: Pause/Play | [R]: Replay | Sens: [ / ] | Quit: Q"
+    else:
+        controls_msg = "Profiles [1:Mini | 2:Std | 3:Hvy | 4:Wing] | Sens: [ / ] | Light: B | Quit: Q"
+        
     (cw, _), _ = cv2.getTextSize(controls_msg, cv2.FONT_HERSHEY_SIMPLEX, 0.40, 1)
     cv2.putText(frame, controls_msg, (w - cw - 15, h - 17), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (180, 180, 180), 1, cv2.LINE_AA)
 
@@ -383,9 +427,17 @@ while True:
     # ---------------------------------------------------------
     # 8. KEYBOARD COMMAND DISPATCHER
     # ---------------------------------------------------------
-    key = cv2.waitKey(1) & 0xFF
+    wait_delay = 30 if is_video_file and not is_paused else 1
+    key = cv2.waitKey(wait_delay) & 0xFF
     if key in (ord("q"), ord("Q"), 27):
         break
+    elif key == ord(" "):  # Space: Pause/Resume video
+        is_paused = not is_paused
+    elif key in (ord("r"), ord("R")):  # R: Replay video
+        if is_video_file:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            is_paused = False
+            tracks_db.clear()
     elif key in (ord("1"), ord("2"), ord("3"), ord("4")):
         active_profile_id = int(chr(key))
         target_nominal_width = DRONE_PROFILES[active_profile_id]["width"]
@@ -401,7 +453,3 @@ while True:
 
 cap.release()
 cv2.destroyAllWindows()
-
-
-
-
