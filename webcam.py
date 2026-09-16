@@ -197,12 +197,13 @@ class TargetKinematics:
                     self.eta_seconds = None
 
 tracks_db = {}
-MIN_CONSECUTIVE_FRAMES = 2  # Responsive confirmation for distant mini drones
-MAX_MISSED_FRAMES = 20      # Maintain track lock even if drone banks or flies far away
+MIN_CONSECUTIVE_FRAMES = 1  # Instant response for small mini drones
+MAX_MISSED_FRAMES = 25      # Generous track retention for hand-held & distant tests
 
-# UI State (Default 25% for high-sensitivity long-range detection)
-conf_percent = 25
+# UI State (Default 15% sensitivity for tiny hand-held / distant mini drones)
+conf_percent = 15
 brightness_boost = 0
+clahe_enabled = False
 dragging_slider = False
 SLIDER_X1, SLIDER_X2, SLIDER_Y1, SLIDER_Y2 = 145, 520, 0, 0
 
@@ -212,10 +213,10 @@ def handle_mouse(event, x, y, flags, param):
         if SLIDER_X1 - 15 <= x <= SLIDER_X2 + 15 and SLIDER_Y1 - 10 <= y <= SLIDER_Y2 + 10:
             dragging_slider = True
             norm_val = (x - SLIDER_X1) / max(1, (SLIDER_X2 - SLIDER_X1))
-            conf_percent = int(max(10, min(95, 10 + norm_val * 85)))
+            conf_percent = int(max(5, min(95, 5 + norm_val * 90)))
     elif event == cv2.EVENT_MOUSEMOVE and dragging_slider:
         norm_val = (x - SLIDER_X1) / max(1, (SLIDER_X2 - SLIDER_X1))
-        conf_percent = int(max(10, min(95, 10 + norm_val * 85)))
+        conf_percent = int(max(5, min(95, 5 + norm_val * 90)))
     elif event == cv2.EVENT_LBUTTONUP:
         dragging_slider = False
 
@@ -260,6 +261,14 @@ while True:
     if brightness_boost != 0:
         frame = cv2.convertScaleAbs(frame, alpha=1.0, beta=brightness_boost)
 
+    # Optional CLAHE Contrast & Edge Enhancement (Key 'C')
+    if clahe_enabled:
+        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        l = clahe.apply(l)
+        frame = cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
+
     h, w, _ = frame.shape
     cx_cam = w / 2.0
     cy_cam = h / 2.0
@@ -267,12 +276,12 @@ while True:
 
     conf_threshold = conf_percent / 100.0
 
-    # Hardware-Accelerated YOLO Inference with Multi-Stage Track Association
+    # Hardware-Accelerated YOLO Inference with High-Sensitivity Multi-Stage Tracking
     results = model.track(
         frame,
         persist=True,
         tracker="bytetrack.yaml",
-        conf=max(0.12, conf_threshold * 0.80),
+        conf=max(0.05, conf_threshold * 0.70),
         iou=0.45,
         imgsz=current_imgsz,
         device=DEVICE,
@@ -291,7 +300,7 @@ while True:
             cls_id = int(box.cls[0])
             confidence = float(box.conf[0])
 
-            if cls_id != DRONE_CLASS_ID or confidence < (conf_threshold * 0.90):
+            if cls_id != DRONE_CLASS_ID or confidence < max(0.06, conf_threshold * 0.75):
                 continue
 
             track_id = int(box.id[0]) if box.id is not None else None
@@ -300,8 +309,8 @@ while True:
             # Use characteristic dimension max(box_w, box_h) so rotated/tilted drones at any 3D angle are tracked accurately
             char_dim = max(box_w, box_h)
 
-            # Filter massive screen-filling objects (laptops, humans taking > 45% of entire screen)
-            if (box_w * box_h) > (0.45 * w * h):
+            # Filter massive screen-filling objects (laptops, humans taking > 50% of entire screen)
+            if (box_w * box_h) > (0.50 * w * h):
                 continue
 
             # Anti-glitch persistence
@@ -326,8 +335,8 @@ while True:
 
             target_kin.update(frame_count, current_time, x_3d, y_3d, z_est, sigma_d)
 
-            # Require persistent confirmation (2 frames or confidence >= 0.40)
-            if target_kin.hits >= MIN_CONSECUTIVE_FRAMES or confidence >= 0.40:
+            # Require persistent confirmation (1-2 frames or confidence >= 0.20)
+            if target_kin.hits >= MIN_CONSECUTIVE_FRAMES or confidence >= 0.20:
                 confirmed_drone_count += 1
                 disp_z = target_kin.smoothed_z if target_kin.smoothed_z is not None else z_est
 
@@ -459,7 +468,8 @@ while True:
     if is_video_file:
         controls_msg = "Profiles [1-4] | [SPACE]: Pause/Play | [R]: Replay | Mode: [T] | Quit: Q"
     else:
-        controls_msg = "Profiles [1-4] | Turbo/Res: [T] | Sens: [ / ] | Light: B | Quit: Q"
+        clahe_tag = "[ON]" if clahe_enabled else ""
+        controls_msg = f"Profiles [1-4] | Mode: [T] | Contrast: [C]{clahe_tag} | Sens: [ / ] | Quit: Q"
         
     (cw, _), _ = cv2.getTextSize(controls_msg, cv2.FONT_HERSHEY_SIMPLEX, 0.40, 1)
     cv2.putText(frame, controls_msg, (w - cw - 15, h - 17), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (180, 180, 180), 1, cv2.LINE_AA)
@@ -478,6 +488,9 @@ while True:
         curr_idx = resolutions.index(current_imgsz) if current_imgsz in resolutions else 0
         current_imgsz = resolutions[(curr_idx + 1) % len(resolutions)]
         print(f"[*] Switched Inference Resolution Mode: {current_imgsz}px")
+    elif key in (ord("c"), ord("C")):  # C: Toggle CLAHE Contrast Enhancement
+        clahe_enabled = not clahe_enabled
+        print(f"[*] CLAHE Edge & Contrast Boost: {'ENABLED' if clahe_enabled else 'DISABLED'}")
     elif key == ord(" "):  # Space: Pause/Resume video
         is_paused = not is_paused
     elif key in (ord("r"), ord("R")):  # R: Replay video
@@ -492,7 +505,7 @@ while True:
     elif key in (ord("+"), ord("="), ord("]"), 0, 82):
         conf_percent = min(95, conf_percent + 5)
     elif key in (ord("-"), ord("_"), ord("["), 1, 84):
-        conf_percent = max(10, conf_percent - 5)
+        conf_percent = max(5, conf_percent - 5)
     elif key in (ord("b"),):
         brightness_boost = (brightness_boost + 15) if brightness_boost < 60 else -30
     elif key in (ord("B"),):
