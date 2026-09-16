@@ -296,23 +296,11 @@ while True:
             track_id = int(box.id[0]) if box.id is not None else None
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             box_w, box_h = (x2 - x1), (y2 - y1)
-            aspect_ratio = float(box_w) / max(1.0, float(box_h))
+            # Use characteristic dimension max(box_w, box_h) so rotated/tilted drones at any 3D angle are tracked accurately
+            char_dim = max(box_w, box_h)
 
-            # 1. Human Face / Head Filter:
-            # Human faces and heads are vertically elongated (aspect_ratio < 0.88).
-            # Drones have wider horizontal wingspans and propeller arms (aspect_ratio >= 0.95).
-            if aspect_ratio < 0.85 and confidence < 0.65:
-                continue
-
-            # 2. Scale-Adaptive Confidence Gate:
-            # Real drones up-close produce strong confidence (> 60-90%).
-            # Human faces/heads in front of the webcam only trigger weak false positives (30-48%).
-            # Enforce 55% threshold on large close-up objects, while keeping 35% for small distant drones in the sky.
-            if (box_w > 90 or box_h > 90) and confidence < 0.55:
-                continue
-
-            # Filter massive screen-filling objects (laptops, humans right against lens)
-            if (box_w * box_h) > (0.35 * w * h):
+            # Filter massive screen-filling objects (laptops, humans taking > 45% of entire screen)
+            if (box_w * box_h) > (0.45 * w * h):
                 continue
 
             # Anti-glitch persistence
@@ -324,9 +312,9 @@ while True:
             
             target_kin = tracks_db[track_id]
 
-            # Compute Monocular Distance & CRLB
+            # Compute Monocular Distance & CRLB (using rotation-invariant dimension)
             z_est, sigma_d, ci_low, ci_high, crlb_var = compute_crlb_distance(
-                box_w, box_h, target_nominal_width, FOCAL_LENGTH_PX, SIGMA_PIXEL
+                char_dim, box_h, target_nominal_width, FOCAL_LENGTH_PX, SIGMA_PIXEL
             )
 
             # 3D Coordinates relative to camera optical axis
