@@ -270,6 +270,7 @@ while True:
 
             track_id = int(box.id[0]) if box.id is not None else None
             x1, y1, x2, y2 = map(int, box.xyxy[0])
+            box_w, box_h = (x2 - x1), (y2 - y1)
             aspect_ratio = float(box_w) / max(1.0, float(box_h))
 
             # 1. Human Face / Head Filter:
