@@ -154,7 +154,31 @@ def compute_crlb_distance(pixel_w, pixel_h, target_w, focal_length, sigma_w):
     ci_lower = max(0.1, distance_z - 2.0 * sigma_d)
     ci_upper = distance_z + 2.0 * sigma_d
     
-    return distance_z, sigma_d, ci_lower, ci_upper, total_crlb_variance
+def is_hollow_eyeglasses(crop_bgr):
+    """
+    Discriminates hollow eyeglasses frames from real drones with physical motors/fuselage.
+    Eyeglasses have two large transparent empty lens regions (< 2.8% internal edge density),
+    whereas real drones have motors, propellers, duct struts, camera chassis, and wiring.
+    """
+    if crop_bgr is None or crop_bgr.size == 0:
+        return False
+    ch, cw, _ = crop_bgr.shape
+    if ch < 18 or cw < 25:
+        return False
+        
+    gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 30, 100)
+    
+    # Left and Right optical lens centers (inner 50% height, 18-38% width and 62-82% width)
+    y1, y2 = int(0.22 * ch), int(0.78 * ch)
+    left_lens = edges[y1:y2, int(0.18 * cw):int(0.38 * cw)]
+    right_lens = edges[y1:y2, int(0.62 * cw):int(0.82 * cw)]
+    
+    l_density = np.count_nonzero(left_lens) / max(1, left_lens.size)
+    r_density = np.count_nonzero(right_lens) / max(1, right_lens.size)
+    
+    # If both lens zones are hollow glass windows, reject as eyeglasses
+    return bool(l_density < 0.028 and r_density < 0.028)
 
 # ---------------------------------------------------------
 # 4. KINEMATIC TRACKER MEMORY (3D State, Velocity, History)
@@ -352,6 +376,11 @@ while True:
 
             # 2. Filter massive screen-filling objects (laptops, walls taking > 60% of screen)
             if (box_w * box_h) > (0.60 * w * h):
+                continue
+
+            # 3. Optical Hollow-Lens Filter (Instant Eyeglasses / Spectacles Rejection):
+            crop = frame[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
+            if is_hollow_eyeglasses(crop):
                 continue
 
             # Anti-glitch persistence
