@@ -270,10 +270,23 @@ while True:
 
             track_id = int(box.id[0]) if box.id is not None else None
             x1, y1, x2, y2 = map(int, box.xyxy[0])
-            box_w, box_h = (x2 - x1), (y2 - y1)
+            aspect_ratio = float(box_w) / max(1.0, float(box_h))
+
+            # 1. Human Face / Head Filter:
+            # Human faces and heads are vertically elongated (aspect_ratio < 0.88).
+            # Drones have wider horizontal wingspans and propeller arms (aspect_ratio >= 0.95).
+            if aspect_ratio < 0.85 and confidence < 0.65:
+                continue
+
+            # 2. Scale-Adaptive Confidence Gate:
+            # Real drones up-close produce strong confidence (> 60-90%).
+            # Human faces/heads in front of the webcam only trigger weak false positives (30-48%).
+            # Enforce 55% threshold on large close-up objects, while keeping 35% for small distant drones in the sky.
+            if (box_w > 90 or box_h > 90) and confidence < 0.55:
+                continue
 
             # Filter massive screen-filling objects (laptops, humans right against lens)
-            if (box_w * box_h) > (0.40 * w * h):
+            if (box_w * box_h) > (0.35 * w * h):
                 continue
 
             # Anti-glitch persistence
