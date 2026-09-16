@@ -10,13 +10,32 @@ from ultralytics import YOLO
 # ---------------------------------------------------------
 # 1. PARSE ARGUMENTS & LOAD YOLO MODEL
 # ---------------------------------------------------------
+# ---------------------------------------------------------
+# 1. PARSE ARGUMENTS & LOAD YOLO MODEL WITH ACCELERATION
+# ---------------------------------------------------------
+import torch
+
 parser = argparse.ArgumentParser(description="Drone Defense & CRLB Distance Estimation System")
 parser.add_argument("--video", "-v", type=str, default=None, help="Path to test video file (e.g. drone_test.mp4)")
 parser.add_argument("--camera", "-c", type=int, default=None, help="Camera index (e.g. 0, 1, 2)")
+parser.add_argument("--imgsz", type=int, default=640, help="Inference resolution: 640 (fastest/smoothest) or 960/1280 (long range)")
 parser.add_argument("video_pos", nargs="?", default=None, help="Positional video file path")
 args, _ = parser.parse_known_args()
 
 video_source = args.video if args.video else args.video_pos
+current_imgsz = args.imgsz
+
+# Auto-detect best hardware device (NVIDIA CUDA, Apple Silicon MPS, or multi-threaded CPU)
+if torch.cuda.is_available():
+    DEVICE = "cuda"
+    print("[*] Hardware Acceleration: NVIDIA CUDA GPU (High Performance)")
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    DEVICE = "mps"
+    print("[*] Hardware Acceleration: Apple Silicon Metal GPU (High Performance)")
+else:
+    DEVICE = "cpu"
+    torch.set_num_threads(min(8, os.cpu_count() or 4))
+    print(f"[*] Hardware Acceleration: Multi-Threaded CPU ({torch.get_num_threads()} threads)")
 
 MODEL_PATH = "models/best.pt"
 model = YOLO(MODEL_PATH)
@@ -28,7 +47,7 @@ for cls_id, name in model.names.items():
         break
 
 # ---------------------------------------------------------
-# 2. SOURCE SETUP (Video File vs Live External/Internal Camera)
+# 2. SOURCE SETUP (Zero-Latency Live Camera & Video Stream)
 # ---------------------------------------------------------
 cap = None
 is_video_file = False
@@ -54,10 +73,20 @@ if cap is None or not cap.isOpened():
         if not temp_cap.isOpened():
             temp_cap = cv2.VideoCapture(cam_idx)
         if temp_cap.isOpened():
+            # Hardware acceleration: Zero-latency buffer & fast MJPEG codec
+            try:
+                temp_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+                temp_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                temp_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+                temp_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+                temp_cap.set(cv2.CAP_PROP_FPS, 30)
+            except Exception:
+                pass
+
             ret, test_frame = temp_cap.read()
             if ret and test_frame is not None:
                 cap = temp_cap
-                print(f"[*] Successfully connected to Live Camera (index {cam_idx})")
+                print(f"[*] Successfully connected to Live Camera (index {cam_idx}) at Zero-Latency Buffer")
                 break
             else:
                 temp_cap.release()
@@ -66,12 +95,6 @@ if cap is None or not cap.isOpened():
     print("ERROR: Could not open camera or video file. Please check connections or video path.")
     exit(1)
 
-# Set high resolution
-if not is_video_file:
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
-    cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)
-
 WINDOW_NAME = "Drone Defense System - CRLB Range & Kinematics Engine"
 cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
 
@@ -79,9 +102,10 @@ cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
 # 3. CRAMER-RAO LOWER BOUND (CRLB) & PHYSICAL TARGET MODELS
 # ---------------------------------------------------------
 # Camera Optical Model: Focal length in pixels (calibrated for standard ~80 deg HFOV at 1080p/720p)
-FOCAL_LENGTH_PX = 1150.0   # Updated dynamically if resolution changes
-SIGMA_PIXEL = 3.5          # Realistic YOLO bounding box edge regression noise std-dev (pixels)
+FOCAL_LENGTH_PX = 850.0    # Updated dynamically based on frame width
+SIGMA_PIXEL = 2.5          # Realistic YOLO bounding box edge regression noise std-dev (pixels)
 POSE_ASPECT_RATIO_UNCERTAINTY = 0.045  # 4.5% standard error due to 3D drone yaw/pitch rotation
+
 
 # Drone Physical Size Profiles (Wingspan in meters)
 DRONE_PROFILES = {
@@ -238,18 +262,19 @@ while True:
     h, w, _ = frame.shape
     cx_cam = w / 2.0
     cy_cam = h / 2.0
-    FOCAL_LENGTH_PX = (w / 1920.0) * 1150.0  # Dynamic focal length scaling
+    FOCAL_LENGTH_PX = (w / 1280.0) * 850.0  # Dynamic focal length scaling
 
     conf_threshold = conf_percent / 100.0
 
-    # High-Resolution YOLO Inference
+    # Hardware-Accelerated YOLO Inference
     results = model.track(
         frame,
         persist=True,
         tracker="bytetrack.yaml",
         conf=conf_threshold,
         iou=0.45,
-        imgsz=1280,
+        imgsz=current_imgsz,
+        device=DEVICE,
         verbose=False
     )
 
@@ -443,9 +468,9 @@ while True:
 
     # Key helpers & Profile selector prompt
     if is_video_file:
-        controls_msg = "Profiles [1-4] | [SPACE]: Pause/Play | [R]: Replay | Sens: [ / ] | Quit: Q"
+        controls_msg = "Profiles [1-4] | [SPACE]: Pause/Play | [R]: Replay | Mode: [T] | Quit: Q"
     else:
-        controls_msg = "Profiles [1:Mini | 2:Std | 3:Hvy | 4:Wing] | Sens: [ / ] | Light: B | Quit: Q"
+        controls_msg = "Profiles [1-4] | Turbo/Res: [T] | Sens: [ / ] | Light: B | Quit: Q"
         
     (cw, _), _ = cv2.getTextSize(controls_msg, cv2.FONT_HERSHEY_SIMPLEX, 0.40, 1)
     cv2.putText(frame, controls_msg, (w - cw - 15, h - 17), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (180, 180, 180), 1, cv2.LINE_AA)
@@ -459,6 +484,11 @@ while True:
     key = cv2.waitKey(wait_delay) & 0xFF
     if key in (ord("q"), ord("Q"), 27):
         break
+    elif key in (ord("t"), ord("T")):  # T: Toggle Turbo 60FPS (640) <-> Ultra-Range (1280)
+        resolutions = [640, 960, 1280]
+        curr_idx = resolutions.index(current_imgsz) if current_imgsz in resolutions else 0
+        current_imgsz = resolutions[(curr_idx + 1) % len(resolutions)]
+        print(f"[*] Switched Inference Resolution Mode: {current_imgsz}px")
     elif key == ord(" "):  # Space: Pause/Resume video
         is_paused = not is_paused
     elif key in (ord("r"), ord("R")):  # R: Replay video
