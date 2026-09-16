@@ -182,6 +182,35 @@ def is_hollow_eyeglasses(crop_bgr):
     # If both lens zones are hollow glass windows, reject as eyeglasses
     return bool(l_density < 0.028 and r_density < 0.028)
 
+def is_human_or_face_false_positive(crop_bgr, aspect_ratio, confidence):
+    """
+    Discriminates humans, faces, and nearby bodies from airborne drones.
+    - Faces and people have vertical elongation (aspect_ratio < 0.88).
+    - Skin-tone detection in YCrCb color space accurately detects human faces/hands/arms.
+    - Real multirotor drones have horizontal/square aspect ratios (>= 0.90) and non-skin materials.
+    """
+    if crop_bgr is None or crop_bgr.size == 0:
+        return False
+        
+    # 1. Reject purely vertical shapes (taller than wide) unless exceptionally high confidence
+    if aspect_ratio < 0.88 and confidence < 0.55:
+        return True
+        
+    # 2. Skin-tone analysis across human face/skin color ranges
+    ycrcb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2YCrCb)
+    skin_mask = cv2.inRange(ycrcb, np.array([0, 133, 77]), np.array([255, 173, 127]))
+    skin_ratio = np.count_nonzero(skin_mask) / max(1, skin_mask.size)
+    
+    # Face / hand / person signature: vertical or square shape with > 18% skin tone
+    if aspect_ratio < 1.15 and skin_ratio > 0.18:
+        return True
+        
+    # General skin presence > 32% even if wide
+    if skin_ratio > 0.32:
+        return True
+        
+    return False
+
 # ---------------------------------------------------------
 # 4. KINEMATIC TRACKER MEMORY (3D State, Velocity, History)
 # ---------------------------------------------------------
@@ -380,9 +409,11 @@ while True:
             if (box_w * box_h) > (0.60 * w * h):
                 continue
 
-            # 3. Optical Hollow-Lens Filter (Instant Eyeglasses / Spectacles Rejection):
+            # 3. Optical Hollow-Lens & Human / Face Rejection Filter:
             crop = frame[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
             if is_hollow_eyeglasses(crop):
+                continue
+            if is_human_or_face_false_positive(crop, aspect_ratio, confidence):
                 continue
 
             # Anti-glitch persistence
