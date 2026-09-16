@@ -154,6 +154,8 @@ def compute_crlb_distance(pixel_w, pixel_h, target_w, focal_length, sigma_w):
     ci_lower = max(0.1, distance_z - 2.0 * sigma_d)
     ci_upper = distance_z + 2.0 * sigma_d
     
+    return distance_z, sigma_d, ci_lower, ci_upper, total_crlb_variance
+
 def is_hollow_eyeglasses(crop_bgr):
     """
     Discriminates hollow eyeglasses frames from real drones with physical motors/fuselage.
