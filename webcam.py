@@ -171,16 +171,25 @@ class TargetKinematics:
         self.approach_rate = 0.0  # m/s (+ approaching, - receding)
         self.eta_seconds = None
         self.type_votes = {"CIVILIAN": 0.0, "MILITARY": 0.0}
+        self.cached_type = "UNKNOWN"
+        self.cached_type_score = 0.0
+        self.last_classified_frame = -10
 
     def update_type(self, label, confidence):
         """Smooth classifications over a track to avoid frame-to-frame flicker."""
         for known_label in self.type_votes:
-            self.type_votes[known_label] *= 0.90
+            self.type_votes[known_label] *= 0.88
         if label in self.type_votes:
             self.type_votes[label] += confidence
 
         label, score = max(self.type_votes.items(), key=lambda item: item[1])
-        return (label, score) if score >= 1.0 else ("UNKNOWN", 0.0)
+        if score >= 0.90:
+            self.cached_type = label
+            self.cached_type_score = min(0.99, score / (score + 0.35))
+        else:
+            self.cached_type = "UNKNOWN"
+            self.cached_type_score = 0.0
+        return self.cached_type, self.cached_type_score
 
     def update(self, frame_num, timestamp, x_m, y_m, z_m, sigma_d):
         self.hits += 1
@@ -319,7 +328,7 @@ while True:
             cls_id = int(box.cls[0])
             confidence = float(box.conf[0])
 
-            if cls_id != DRONE_CLASS_ID or confidence < max(0.06, conf_threshold * 0.75):
+            if cls_id != DRONE_CLASS_ID or confidence < max(0.05, conf_threshold * 0.70):
                 continue
 
             track_id = int(box.id[0]) if box.id is not None else None
@@ -328,21 +337,21 @@ while True:
             aspect_ratio = float(box_w) / max(1.0, float(box_h))
             char_dim = max(box_w, box_h)
 
-            # 1. Eyeglasses / Spectacles & Desktop Clutter Rejection Filter:
-            # - Multi-rotor drones (Profiles 1-3) have compact symmetric footprints (aspect ratio 0.65 - 1.75).
-            # - Eyeglasses/Spectacles have wide, elongated horizontal profiles (aspect ratio 1.85 - 3.8).
-            # - Filter out elongated clutter (specs, pens, keyboards) unless confidence is exceptionally high (> 0.50).
+            # 1. Clutter & Eyeglasses Rejection Filter:
+            # - Eyeglasses flat on desk have extreme horizontal aspect ratios (> 2.85) and thin vertical frames.
+            # - Quadcopters (Profiles 1-3) can range between 0.35 and 2.6 when viewed in hand/desk at angles.
+            # - Fixed-wings (Profile 4) can have wide wingspans up to 3.8.
             if active_profile_id != 4:  # For Multirotors (Mini 24cm, Standard 38cm, Heavy 75cm)
-                if (aspect_ratio > 1.80 or aspect_ratio < 0.45) and confidence < 0.48:
+                if (aspect_ratio > 2.85 or aspect_ratio < 0.28) and confidence < 0.45:
                     continue
-                if aspect_ratio > 2.2:  # Strictly reject extreme wide shapes (glasses, bars)
+                if aspect_ratio > 3.6:  # Strictly reject extreme slivers (eyeglasses flat on desk)
                     continue
             else:  # Tactical Fixed-Wing Profile
-                if (aspect_ratio > 3.0 or aspect_ratio < 0.30) and confidence < 0.45:
+                if (aspect_ratio > 4.0 or aspect_ratio < 0.22) and confidence < 0.40:
                     continue
 
-            # 2. Filter massive screen-filling objects (laptops, walls taking > 45% of screen)
-            if (box_w * box_h) > (0.45 * w * h):
+            # 2. Filter massive screen-filling objects (laptops, walls taking > 60% of screen)
+            if (box_w * box_h) > (0.60 * w * h):
                 continue
 
             # Anti-glitch persistence
@@ -367,14 +376,24 @@ while True:
 
             target_kin.update(frame_count, current_time, x_3d, y_3d, z_est, sigma_d)
 
-            # Crop the detected aircraft, then classify it with the optional
-            # type-specific model. The detector itself only knows "drone".
-            crop = frame[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
-            frame_type, frame_type_conf = type_classifier.classify(crop, device=DEVICE)
-            drone_type, drone_type_score = target_kin.update_type(frame_type, frame_type_conf)
+            # Efficient Drone Type Classifier:
+            # Query classifier on first detection or periodically every 6 frames to preserve maximum FPS
+            if type_classifier.enabled and (target_kin.cached_type == "UNKNOWN" or (frame_count - target_kin.last_classified_frame >= 6)):
+                crop = frame[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
+                if crop.size > 0:
+                    frame_type, frame_type_conf = type_classifier.classify(crop, device=DEVICE)
+                    target_kin.last_classified_frame = frame_count
+                    drone_type, drone_type_score = target_kin.update_type(frame_type, frame_type_conf)
+                else:
+                    drone_type, drone_type_score = target_kin.cached_type, target_kin.cached_type_score
+            else:
+                drone_type, drone_type_score = target_kin.cached_type, target_kin.cached_type_score
 
-            # Require persistent confirmation (1-2 frames or confidence >= 0.20)
-            if target_kin.hits >= MIN_CONSECUTIVE_FRAMES or confidence >= 0.20:
+            # Multi-frame Track Confirmation & Anti-Face-Glitch:
+            # - High confidence (>= 0.38): immediate confirmation
+            # - Moderate/Low confidence (< 0.38): require >= 2 consecutive frames to eliminate momentary 1-frame face blips
+            is_confirmed = (confidence >= 0.38) or (target_kin.hits >= 2)
+            if is_confirmed:
                 confirmed_drone_count += 1
                 disp_z = target_kin.smoothed_z if target_kin.smoothed_z is not None else z_est
 
@@ -446,7 +465,7 @@ while True:
                     line3 = f"VEL: {target_kin.speed_kmh:.1f}km/h (HOVER / LATERAL)"
                     line3_color = (220, 220, 220)
 
-                badge_w = max(340, int(box_w + 80))
+                badge_w = max(420, int(box_w + 80))
                 badge_h = 58
                 badge_y1 = max(0, y1 - badge_h - 6)
                 badge_y2 = y1 - 6
