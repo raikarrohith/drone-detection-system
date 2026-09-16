@@ -80,7 +80,8 @@ cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
 # ---------------------------------------------------------
 # Camera Optical Model: Focal length in pixels (calibrated for standard ~80 deg HFOV at 1080p/720p)
 FOCAL_LENGTH_PX = 1150.0   # Updated dynamically if resolution changes
-SIGMA_PIXEL = 1.5          # Bounding box edge localization noise std-dev (pixels)
+SIGMA_PIXEL = 3.5          # Realistic YOLO bounding box edge regression noise std-dev (pixels)
+POSE_ASPECT_RATIO_UNCERTAINTY = 0.045  # 4.5% standard error due to 3D drone yaw/pitch rotation
 
 # Drone Physical Size Profiles (Wingspan in meters)
 DRONE_PROFILES = {
@@ -101,22 +102,26 @@ def compute_crlb_distance(pixel_w, pixel_h, target_w, focal_length, sigma_w):
     Sensitivity Derivative: dw/dD = -(W * F) / D^2
     Fisher Information I(D) = (1 / sigma_w^2) * (dw/dD)^2 = (W^2 * F^2) / (sigma_w^2 * D^4)
     CRLB(D) = 1 / I(D) = (sigma_w^2 * D^4) / (W^2 * F^2)
-    Minimum Standard Error: sigma_D = sqrt(CRLB) = (sigma_w * D^2) / (W * F)
+    Minimum Standard Error: sigma_D = sqrt(CRLB_pixel + sigma_pose^2)
     """
     pixel_w = max(2.0, float(pixel_w))
     # Estimated Distance (Z in meters)
     distance_z = (target_w * focal_length) / pixel_w
     
-    # Fisher Information & CRLB Variance
-    fisher_info = (target_w**2 * focal_length**2) / ((sigma_w**2) * (distance_z**4))
-    crlb_variance = 1.0 / max(1e-9, fisher_info)
-    sigma_d = math.sqrt(crlb_variance)
+    # Fisher Information & CRLB Variance from Pixel Localization Noise
+    fisher_info_pixel = (target_w**2 * focal_length**2) / ((sigma_w**2) * (distance_z**4))
+    crlb_var_pixel = 1.0 / max(1e-9, fisher_info_pixel)
+    
+    # Combined variance with 3D pose/aspect angle uncertainty
+    crlb_var_pose = (POSE_ASPECT_RATIO_UNCERTAINTY * distance_z) ** 2
+    total_crlb_variance = crlb_var_pixel + crlb_var_pose
+    sigma_d = math.sqrt(total_crlb_variance)
     
     # 95% Confidence Interval (2-sigma theoretical bound)
-    ci_lower = max(0.2, distance_z - 2.0 * sigma_d)
+    ci_lower = max(0.1, distance_z - 2.0 * sigma_d)
     ci_upper = distance_z + 2.0 * sigma_d
     
-    return distance_z, sigma_d, ci_lower, ci_upper, crlb_variance
+    return distance_z, sigma_d, ci_lower, ci_upper, total_crlb_variance
 
 # ---------------------------------------------------------
 # 4. KINEMATIC TRACKER MEMORY (3D State, Velocity, History)
@@ -326,20 +331,29 @@ while True:
                 cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
                 corner_len = max(8, min(24, box_w // 3, box_h // 3))
                 cv2.line(frame, (x1, y1), (x1 + corner_len, y1), (0, 255, 255), 3)
-                cv2.line(frame, (x1, y1), (x1, y1 + corner_len), (0, 255, 255), 3)
+                cv2.line(frame, (x1, y1), (x1 + corner_len, y1), (0, 255, 255), 3)
                 cv2.line(frame, (x2, y1), (x2 - corner_len, y1), (0, 255, 255), 3)
-                cv2.line(frame, (x2, y1), (x2, y1 + corner_len), (0, 255, 255), 3)
+                cv2.line(frame, (x2, y1), (x2 - corner_len, y1), (0, 255, 255), 3)
                 cv2.line(frame, (x1, y2), (x1 + corner_len, y2), (0, 255, 255), 3)
-                cv2.line(frame, (x1, y2), (x1, y2 - corner_len), (0, 255, 255), 3)
+                cv2.line(frame, (x1, y2), (x1 - corner_len, y2), (0, 255, 255), 3)
                 cv2.line(frame, (x2, y2), (x2 - corner_len, y2), (0, 255, 255), 3)
-                cv2.line(frame, (x2, y2), (x2, y2 - corner_len), (0, 255, 255), 3)
+                cv2.line(frame, (x2, y2), (x2 - corner_len, y2), (0, 255, 255), 3)
 
                 # Center Reticle Target Point
                 cv2.circle(frame, (int(u_center), int(v_center)), 4, (0, 255, 255), -1)
 
                 # --- MULTI-LINE TACTICAL HUD BADGE ---
                 line1 = f"DRONE [ID:{track_id}] {confidence*100:.0f}% | {zone_str}"
-                line2 = f"DIST: {disp_z:.1f}m [CRLB: +/-{sigma_d:.2f}m (2sigma: {ci_low:.1f}-{ci_high:.1f}m)]"
+                
+                # Adaptive error formatting (cm for close range, m for long range)
+                if sigma_d < 0.20:
+                    err_str = f"+/-{sigma_d*100:.1f}cm"
+                    ci_str = f"{ci_low:.2f}-{ci_high:.2f}m"
+                else:
+                    err_str = f"+/-{sigma_d:.2f}m"
+                    ci_str = f"{ci_low:.1f}-{ci_high:.1f}m"
+                    
+                line2 = f"DIST: {disp_z:.2f}m [CRLB: {err_str} (95% CI: {ci_str})]"
                 
                 # Approach vector text
                 if target_kin.approach_rate > 0.8:
@@ -353,7 +367,7 @@ while True:
                     line3 = f"VEL: {target_kin.speed_kmh:.1f}km/h (HOVER / LATERAL)"
                     line3_color = (220, 220, 220)
 
-                badge_w = max(320, int(box_w + 80))
+                badge_w = max(340, int(box_w + 80))
                 badge_h = 58
                 badge_y1 = max(0, y1 - badge_h - 6)
                 badge_y2 = y1 - 6
