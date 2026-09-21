@@ -86,9 +86,13 @@ if cap is None or not cap.isOpened():
             try:
                 temp_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
                 temp_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                temp_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-                temp_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+                # Prefer 1080p on external cameras to retain more pixels for
+                # small, distant targets; cameras that cannot provide it fall
+                # back to their closest supported mode.
+                temp_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+                temp_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
                 temp_cap.set(cv2.CAP_PROP_FPS, 30)
+                temp_cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)
             except Exception:
                 pass
 
