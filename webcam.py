@@ -116,36 +116,69 @@ SIGMA_PIXEL = 2.5          # Realistic YOLO bounding box edge regression noise s
 POSE_ASPECT_RATIO_UNCERTAINTY = 0.045  # 4.5% standard error due to 3D drone yaw/pitch rotation
 
 
-# Drone Physical Size Profiles (Wingspan in meters)
+# Drone Physical Size Profiles (Wingspan, Height, and Diagonal in meters)
 DRONE_PROFILES = {
-    1: {"name": "Micro/Mini", "width": 0.24, "desc": "DJI Mini / Avata (24cm)"},
-    2: {"name": "Standard Quad", "width": 0.38, "desc": "Mavic / Phantom / FPV (38cm) [DEFAULT]"},
-    3: {"name": "Heavy Lift", "width": 0.75, "desc": "Matrice / Hexacopter (75cm)"},
-    4: {"name": "Tactical Wing", "width": 1.40, "desc": "Fixed-Wing / Loitering (140cm)"}
+    1: {"name": "Micro/Mini", "width": 0.24, "height": 0.08, "desc": "DJI Mini / Avata (24x8cm)"},
+    2: {"name": "Standard Quad", "width": 0.38, "height": 0.14, "desc": "Mavic / Phantom / FPV (38x14cm) [DEFAULT]"},
+    3: {"name": "Heavy Lift", "width": 0.75, "height": 0.30, "desc": "Matrice / Hexacopter (75x30cm)"},
+    4: {"name": "Tactical Wing", "width": 1.40, "height": 0.35, "desc": "Fixed-Wing / Loitering (140x35cm)"}
 }
 active_profile_id = 2
-target_nominal_width = DRONE_PROFILES[active_profile_id]["width"]
+target_nominal_profile = DRONE_PROFILES[active_profile_id]
+target_nominal_width = target_nominal_profile["width"]
 
-def compute_crlb_distance(pixel_w, pixel_h, target_w, focal_length, sigma_w):
+def compute_crlb_distance(pixel_w, pixel_h, target_profile, focal_length, sigma_w, u_center=None, v_center=None, cx_cam=None, cy_cam=None):
     """
-    Computes Deterministic Monocular Distance and the theoretical
-    Cramer-Rao Lower Bound (CRLB) / Fisher Information bounds.
+    Computes Deterministic Monocular Distance with Multi-Cue Inverse-Variance Fusion (Derivation 3A)
+    and theoretical Cramer-Rao Lower Bound (CRLB) / Fisher Information bounds (Derivation 2).
     
-    Measurement Model: w = (W * F) / D + epsilon, where epsilon ~ N(0, sigma_w^2)
-    Sensitivity Derivative: dw/dD = -(W * F) / D^2
-    Fisher Information I(D) = (1 / sigma_w^2) * (dw/dD)^2 = (W^2 * F^2) / (sigma_w^2 * D^4)
-    CRLB(D) = 1 / I(D) = (sigma_w^2 * D^4) / (W^2 * F^2)
-    Minimum Standard Error: sigma_D = sqrt(CRLB_pixel + sigma_pose^2)
+    Estimators:
+    1. Width-based:    D_w    = (W * F) / pixel_w
+    2. Height-based:   D_h    = (H * F) / pixel_h
+    3. Diagonal-based: D_diag = (L_diag * F) / pixel_diag
+    
+    Fisher Information weights: w_i = I(D_i) / sum(I(D_j))
+    Fused Distance: D* = sum(w_i * D_i)
+    
+    Off-Axis Angle Correction:
+    Accounts for perspective ray elongation when the target is off optical axis center.
     """
-    pixel_w = max(2.0, float(pixel_w))
-    # Estimated Distance (Z in meters)
-    distance_z = (target_w * focal_length) / pixel_w
+    target_w = target_profile["width"]
+    target_h = target_profile.get("height", target_w * 0.35)
+    target_diag = math.sqrt(target_w**2 + target_h**2)
     
-    # Fisher Information & CRLB Variance from Pixel Localization Noise
-    fisher_info_pixel = (target_w**2 * focal_length**2) / ((sigma_w**2) * (distance_z**4))
-    crlb_var_pixel = 1.0 / max(1e-9, fisher_info_pixel)
+    pw = max(2.0, float(pixel_w))
+    ph = max(2.0, float(pixel_h))
+    pdiag = math.sqrt(pw**2 + ph**2)
     
-    # Combined variance with 3D pose/aspect angle uncertainty
+    # 1. Independent Multi-Cue Distance Estimators
+    d_w = (target_w * focal_length) / pw
+    d_diag = (target_diag * focal_length) / pdiag
+    d_h = (target_h * focal_length) / ph
+    
+    # 2. Fisher Information for each geometric cue
+    fisher_w = (target_w**2 * focal_length**2) / ((sigma_w**2) * (d_w**4))
+    fisher_diag = (target_diag**2 * focal_length**2) / ((sigma_w**2) * (d_diag**4))
+    fisher_h = (target_h**2 * focal_length**2) / ((sigma_w**2) * (d_h**4)) * 0.40  # Lower weight on height due to pitch tilt
+    
+    # 3. Optimal BLUE Inverse-Variance Fusion (Derivation 3A)
+    fisher_total = max(1e-9, fisher_w + fisher_diag + fisher_h)
+    w_w = fisher_w / fisher_total
+    w_diag = fisher_diag / fisher_total
+    w_h = fisher_h / fisher_total
+    
+    slant_distance = (w_w * d_w) + (w_diag * d_diag) + (w_h * d_h)
+    
+    # 4. Off-Axis Perspective Cosine Ray-Angle Correction
+    if u_center is not None and v_center is not None and cx_cam is not None and cy_cam is not None:
+        r_off = math.sqrt((u_center - cx_cam)**2 + (v_center - cy_cam)**2)
+        cos_theta = focal_length / math.sqrt(focal_length**2 + r_off**2)
+        distance_z = slant_distance * cos_theta
+    else:
+        distance_z = slant_distance
+    
+    # 5. Combined CRLB Variance (Pixel Localization + 3D Pose Uncertainty)
+    crlb_var_pixel = 1.0 / fisher_total
     crlb_var_pose = (POSE_ASPECT_RATIO_UNCERTAINTY * distance_z) ** 2
     total_crlb_variance = crlb_var_pixel + crlb_var_pose
     sigma_d = math.sqrt(total_crlb_variance)
@@ -218,14 +251,61 @@ def is_human_or_face_false_positive(crop_bgr, aspect_ratio, confidence):
     return False
 
 # ---------------------------------------------------------
-# 4. KINEMATIC TRACKER MEMORY (3D State, Velocity, History)
+# 4. KINEMATIC TRACKER MEMORY (3D State, Dynamic CRLB Kalman Filter)
 # ---------------------------------------------------------
+class KalmanRangeFilter:
+    """
+    Constant-Velocity Kinematic Kalman Filter with dynamic CRLB measurement noise covariance (Derivation 3B).
+    State vector: x = [z (distance in m), vz (approach velocity in m/s)]^T
+    Dynamically adjusts Kalman Gain K_k = P_k^- H^T (H P_k^- H^T + R_k)^-1 where R_k = CRLB_variance.
+    """
+    def __init__(self, init_z, init_sigma):
+        self.z = float(init_z)
+        self.vz = 0.0
+        self.p00 = max(0.04, float(init_sigma)**2)
+        self.p01 = 0.0
+        self.p10 = 0.0
+        self.p11 = 4.0  # Initial velocity variance (2 m/s std)
+        self.q_pos = 0.05
+        self.q_vel = 0.35
+
+    def predict(self, dt):
+        if dt <= 0 or dt > 1.5:
+            dt = 0.033  # Safe fallback for frame gaps
+        self.z += self.vz * dt
+        # P = F * P * F^T + Q
+        new_p00 = self.p00 + dt * (self.p10 + self.p01) + (dt**2) * self.p11 + self.q_pos * dt
+        new_p01 = self.p01 + dt * self.p11
+        new_p10 = self.p10 + dt * self.p11
+        new_p11 = self.p11 + self.q_vel * dt
+        self.p00, self.p01, self.p10, self.p11 = new_p00, new_p01, new_p10, new_p11
+        return self.z, self.vz
+
+    def update(self, z_meas, crlb_variance):
+        r = max(1e-4, float(crlb_variance))
+        y = z_meas - self.z  # Residual
+        s = self.p00 + r      # Innovation covariance
+        k0 = self.p00 / s    # Optimal Kalman Gain for distance (Derivation 3B)
+        k1 = self.p10 / s    # Optimal Kalman Gain for velocity
+        
+        self.z += k0 * y
+        self.vz += k1 * y
+        
+        # P = (I - K * H) * P
+        self.p00 = max(1e-4, (1.0 - k0) * self.p00)
+        self.p01 = (1.0 - k0) * self.p01
+        self.p10 = -k1 * self.p00 + self.p10
+        self.p11 = max(1e-3, -k1 * self.p01 + self.p11)
+        return self.z, self.vz
+
 class TargetKinematics:
     def __init__(self, track_id):
         self.track_id = track_id
         self.history = []  # [(timestamp, x, y, z, dist, sigma_d)]
         self.hits = 0
         self.last_frame = 0
+        self.last_timestamp = None
+        self.kalman_filter = None
         self.smoothed_z = None
         self.velocity_3d = (0.0, 0.0, 0.0)  # vx, vy, vz in m/s
         self.speed_kmh = 0.0
@@ -252,31 +332,43 @@ class TargetKinematics:
             self.cached_type_score = 0.0
         return self.cached_type, self.cached_type_score
 
-    def update(self, frame_num, timestamp, x_m, y_m, z_m, sigma_d):
+    def update(self, frame_num, timestamp, x_m, y_m, z_m, sigma_d, crlb_variance):
         self.hits += 1
         self.last_frame = frame_num
 
-        # Exponential Moving Average for jitter reduction
-        if self.smoothed_z is None:
+        dt = (timestamp - self.last_timestamp) if (self.last_timestamp is not None) else 0.033
+        self.last_timestamp = timestamp
+
+        # Adaptive CRLB Kalman State Estimation
+        if self.kalman_filter is None:
+            self.kalman_filter = KalmanRangeFilter(z_m, sigma_d)
             self.smoothed_z = z_m
         else:
-            alpha = 0.35  # Smoothing factor
-            self.smoothed_z = alpha * z_m + (1.0 - alpha) * self.smoothed_z
+            self.kalman_filter.predict(dt)
+            filtered_z, filtered_vz = self.kalman_filter.update(z_m, crlb_variance)
+            self.smoothed_z = max(0.1, filtered_z)
 
         self.history.append((timestamp, x_m, y_m, self.smoothed_z, sigma_d))
         if len(self.history) > 30:
             self.history.pop(0)
 
-        # Calculate 3D Velocity & Approach Rate if we have enough temporal baseline (>= 0.15s)
+        # Calculate 3D Velocity & Approach Rate if we have temporal baseline
         if len(self.history) >= 4:
             t_old, x_old, y_old, z_old, _ = self.history[-4]
-            dt = timestamp - t_old
-            if dt > 0.05:
-                vx = (x_m - x_old) / dt
-                vy = (y_m - y_old) / dt
-                vz = (self.smoothed_z - z_old) / dt
+            dt_base = timestamp - t_old
+            if dt_base > 0.05:
+                vx = (x_m - x_old) / dt_base
+                vy = (y_m - y_old) / dt_base
+                vz = (self.smoothed_z - z_old) / dt_base
                 self.velocity_3d = (vx, vy, vz)
                 self.speed_kmh = math.sqrt(vx**2 + vy**2 + vz**2) * 3.6
+                
+                # Approach rate (closing speed along z-axis)
+                self.approach_rate = -vz  # Positive when closing in
+                if self.approach_rate > 0.8:
+                    self.eta_seconds = max(0.1, self.smoothed_z / self.approach_rate)
+                else:
+                    self.eta_seconds = None
                 
                 # Approach rate (closing speed along z-axis)
                 self.approach_rate = -vz  # Positive when closing in
@@ -428,21 +520,23 @@ while True:
 
             if track_id not in tracks_db:
                 tracks_db[track_id] = TargetKinematics(track_id)
-            
             target_kin = tracks_db[track_id]
-
-            # Compute Monocular Distance & CRLB (using rotation-invariant dimension)
-            z_est, sigma_d, ci_low, ci_high, crlb_var = compute_crlb_distance(
-                char_dim, box_h, target_nominal_width, FOCAL_LENGTH_PX, SIGMA_PIXEL
-            )
-
-            # 3D Coordinates relative to camera optical axis
+            
+            # 3D Center coordinates relative to camera optical axis
             u_center = (x1 + x2) / 2.0
             v_center = (y1 + y2) / 2.0
+
+            # Compute Multi-Cue Fused Monocular Distance & CRLB (Derivations 1, 2, 3A)
+            z_est, sigma_d, ci_low, ci_high, crlb_var = compute_crlb_distance(
+                box_w, box_h, target_nominal_profile, FOCAL_LENGTH_PX, SIGMA_PIXEL,
+                u_center, v_center, cx_cam, cy_cam
+            )
+
             x_3d = ((u_center - cx_cam) * z_est) / FOCAL_LENGTH_PX
             y_3d = ((v_center - cy_cam) * z_est) / FOCAL_LENGTH_PX
 
-            target_kin.update(frame_count, current_time, x_3d, y_3d, z_est, sigma_d)
+            # Update Kinematics with Adaptive CRLB Kalman State Estimator (Derivation 3B)
+            target_kin.update(frame_count, current_time, x_3d, y_3d, z_est, sigma_d, crlb_var)
 
             # Efficient Drone Type Classifier:
             # Query classifier on first detection or periodically every 6 frames to preserve maximum FPS
@@ -629,7 +723,8 @@ while True:
             tracks_db.clear()
     elif key in (ord("1"), ord("2"), ord("3"), ord("4")):
         active_profile_id = int(chr(key))
-        target_nominal_width = DRONE_PROFILES[active_profile_id]["width"]
+        target_nominal_profile = DRONE_PROFILES[active_profile_id]
+        target_nominal_width = target_nominal_profile["width"]
         print(f"[*] Switched Drone Size Profile: {DRONE_PROFILES[active_profile_id]['desc']}")
     elif key in (ord("+"), ord("="), ord("]"), 0, 82):
         conf_percent = min(95, conf_percent + 5)

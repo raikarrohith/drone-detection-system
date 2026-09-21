@@ -4,5 +4,10 @@ cd /d "%~dp0"
 echo ========================================================
 echo Starting Drone Detection System...
 echo ========================================================
-venv\Scripts\python.exe webcam.py
+if "%~1"=="" (
+    venv\Scripts\python.exe webcam.py
+) else (
+    echo Loading input video: "%~1"
+    venv\Scripts\python.exe webcam.py --video "%~1"
+)
 pause
