@@ -322,23 +322,36 @@ def is_hollow_eyeglasses(crop_bgr):
 
 def is_human_or_face_false_positive(crop_bgr, aspect_ratio, confidence):
     """
-    Discriminates tall standing humans and close-up faces while preserving distant drones.
+    Discriminates humans, faces, and moving heads from airborne and desk drones.
+    - Dual HSV + YCrCb chrominance detects human facial skin across complexions and lighting.
+    - Rejects moving heads, faces, and nearby humans while preserving flying and desk drones.
     """
     if crop_bgr is None or crop_bgr.size == 0:
         return False
         
-    # Only reject distinctly tall vertical objects (standing human / vertical face)
-    if aspect_ratio < 0.70 and confidence < 0.50:
-        hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
-        ycrcb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2YCrCb)
-        mask_hsv1 = cv2.inRange(hsv, np.array([0, 25, 45]), np.array([25, 255, 255]))
-        mask_hsv2 = cv2.inRange(hsv, np.array([170, 25, 45]), np.array([180, 255, 255]))
-        mask_hsv = cv2.bitwise_or(mask_hsv1, mask_hsv2)
-        mask_ycrcb = cv2.inRange(ycrcb, np.array([0, 130, 75]), np.array([255, 180, 135]))
-        skin_mask = cv2.bitwise_and(mask_hsv, mask_ycrcb)
-        skin_ratio = np.count_nonzero(skin_mask) / max(1, skin_mask.size)
-        if skin_ratio > 0.35:
-            return True
+    # 1. Reject vertically elongated shapes (faces, standing/sitting humans) unless exceptionally high confidence
+    if aspect_ratio < 0.95 and confidence < 0.70:
+        return True
+        
+    # 2. Dual HSV + YCrCb Chromaticity Skin Analysis
+    hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
+    ycrcb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2YCrCb)
+    
+    mask_hsv1 = cv2.inRange(hsv, np.array([0, 25, 45]), np.array([25, 255, 255]))
+    mask_hsv2 = cv2.inRange(hsv, np.array([170, 25, 45]), np.array([180, 255, 255]))
+    mask_hsv = cv2.bitwise_or(mask_hsv1, mask_hsv2)
+    
+    mask_ycrcb = cv2.inRange(ycrcb, np.array([0, 130, 75]), np.array([255, 180, 135]))
+    skin_mask = cv2.bitwise_and(mask_hsv, mask_ycrcb)
+    skin_ratio = np.count_nonzero(skin_mask) / max(1, skin_mask.size)
+    
+    # Face / head / skin signature: contains noticeable skin tone (> 8%) on near-square or vertical shape
+    if aspect_ratio < 1.35 and skin_ratio > 0.08:
+        return True
+        
+    # Moving face / head signature: contains > 16% skin tone regardless of aspect ratio
+    if skin_ratio > 0.16 and confidence < 0.65:
+        return True
         
     return False
 
