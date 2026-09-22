@@ -1,0 +1,14 @@
+                 precision    recall  f1-score   support
+
+      DJI-Mavic     0.6415    0.3953    0.4892        86
+    DJI-Phantom     0.7267    0.8069    0.7647       145
+   Parrot_Bebop     0.3776    0.5522    0.4485        67
+Predator-Reaper     0.4203    0.6591    0.5133        44
+     RQ11-Raven     0.6452    0.3846    0.4819        52
+ RQ4-GlobalHawk     0.5812    0.7312    0.6476        93
+     RQ7-Shadow     0.5775    0.5190    0.5467        79
+ Yuneec-Typhoon     0.8750    0.5122    0.6462        82
+
+       accuracy                         0.5988       648
+      macro avg     0.6056    0.5701    0.5673       648
+   weighted avg     0.6316    0.5988    0.5973       648

@@ -1,62 +1,162 @@
-"""Optional civilian/military drone image classifier.
-
-The detector answers "is this a drone?".  This module deliberately keeps the
-type decision separate: a detector trained with only a `drone` label has no
-evidence to distinguish civilian and military airframes.
-"""
+"""8-class drone identification using the trained custom CNN."""
 
 from pathlib import Path
+import json
 
-from ultralytics import YOLO
+import torch
+import torch.nn as nn
+from torchvision import transforms
+from PIL import Image
 
 
 UNKNOWN = "UNKNOWN"
-VALID_TYPES = {"civilian": "CIVILIAN", "military": "MILITARY"}
+
+
+class DroneCNN(nn.Module):
+    def __init__(self, num_classes=8):
+        super().__init__()
+
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 32, 3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+
+            nn.Conv2d(32, 64, 3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+
+            nn.Conv2d(64, 128, 3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+
+            nn.Conv2d(128, 256, 3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+
+            nn.Conv2d(256, 512, 3, padding=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(),
+
+            nn.AdaptiveAvgPool2d((1, 1))
+        )
+
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Dropout(0.5),
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, num_classes)
+        )
+
+    def forward(self, x):
+        return self.classifier(self.features(x))
 
 
 class DroneTypeClassifier:
-    """Classify cropped drone detections with an Ultralytics classification model.
 
-    A missing model, unsupported model labels, or an uncertain prediction all
-    return UNKNOWN. This avoids turning a visual guess into an alert.
-    """
+    def __init__(self, model_path=None, confidence_threshold=0.45):
 
-    def __init__(self, model_path=None, confidence_threshold=0.70):
         self.confidence_threshold = confidence_threshold
         self.model = None
         self.enabled = False
+        self.classes = []
 
-        if model_path and Path(model_path).is_file():
-            self.model = YOLO(model_path)
+        if model_path is None:
+            model_path = "drone_classifier/model/drone_cnn_best.pth"
+
+        model_path = Path(model_path)
+
+        if not model_path.is_file():
+            print(f"[!] CNN classifier not found: {model_path}")
+            return
+
+        try:
+            checkpoint = torch.load(
+                model_path,
+                map_location="cpu"
+            )
+
+            self.classes = checkpoint["classes"]
+
+            self.model = DroneCNN(len(self.classes))
+            self.model.load_state_dict(checkpoint["model_state"])
+            self.model.eval()
+
+            image_size = checkpoint.get("image_size", 224)
+
+            self.transform = transforms.Compose([
+                transforms.Resize((image_size, image_size)),
+                transforms.ToTensor(),
+                transforms.Normalize(
+                    [0.485, 0.456, 0.406],
+                    [0.229, 0.224, 0.225]
+                )
+            ])
+
             self.enabled = True
 
-    @staticmethod
-    def _label_from_name(name):
-        normalized = str(name).strip().lower().replace("-", "_").replace(" ", "_")
-        # Permit practical dataset labels such as civilian_drone / military_uav.
-        if "civilian" in normalized or "commercial" in normalized:
-            return VALID_TYPES["civilian"]
-        if "military" in normalized or "defense" in normalized:
-            return VALID_TYPES["military"]
-        return UNKNOWN
+            print(
+                f"[*] 8-Class Drone Classifier loaded "
+                f"({len(self.classes)} classes)"
+            )
+
+        except Exception as exc:
+            print(f"[!] Failed to load drone classifier: {exc}")
 
     def classify(self, image, device="cpu"):
-        """Return (label, confidence). `confidence` is 0 for UNKNOWN."""
+
         if not self.enabled or image is None or image.size == 0:
             return UNKNOWN, 0.0
 
         try:
-            result = self.model(image, device=device, verbose=False)[0]
-            if result.probs is None:
-                return UNKNOWN, 0.0
-            class_id = int(result.probs.top1)
-            confidence = float(result.probs.top1conf)
-            label = self._label_from_name(result.names[class_id])
-            if label == UNKNOWN or confidence < self.confidence_threshold:
+            # OpenCV BGR -> RGB
+            image_rgb = image[:, :, ::-1]
+
+            pil_image = Image.fromarray(image_rgb)
+
+            tensor = self.transform(pil_image).unsqueeze(0)
+
+            with torch.no_grad():
+                output = self.model(tensor)
+
+                probabilities = torch.softmax(output, dim=1)
+
+                class_id = int(
+                    torch.argmax(probabilities, dim=1)[0]
+                )
+
+                confidence = float(
+                    probabilities[0, class_id]
+                )
+
+            label = self.classes[class_id]
+
+            if confidence < self.confidence_threshold:
                 return UNKNOWN, confidence
+
             return label, confidence
+
         except Exception as exc:
-            # A bad optional classifier must not stop drone detection/tracking.
-            print(f"[!] Drone type classifier unavailable: {exc}")
-            self.enabled = False
+            print(f"[!] Drone classifier error: {exc}")
             return UNKNOWN, 0.0
+
+# Approximate physical widths in metres.
+# Used by the temporary distance estimator until camera calibration.
+DRONE_WIDTHS = {
+    "DJI-Mavic": 0.35,
+    "DJI-Phantom": 0.35,
+    "Parrot_Bebop": 0.38,
+    "Predator-Reaper": 20.0,
+    "RQ11-Raven": 1.37,
+    "RQ4-GlobalHawk": 39.90,
+    "RQ7-Shadow": 4.57,
+    "Yuneec-Typhoon": 0.54,
+}
+
+def get_drone_width(drone_type):
+    return DRONE_WIDTHS.get(drone_type)

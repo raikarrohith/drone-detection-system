@@ -6,7 +6,7 @@ import argparse
 import cv2
 import numpy as np
 from ultralytics import YOLO
-from drone_classifier import DroneTypeClassifier, get_drone_width
+from drone_classifier import DroneTypeClassifier
 
 # ---------------------------------------------------------
 # 1. PARSE ARGUMENTS & LOAD YOLO MODEL
@@ -557,22 +557,8 @@ while True:
             v_center = (y1 + y2) / 2.0
 
             # Compute Multi-Cue Fused Monocular Distance & CRLB (Derivations 1, 2, 3A)
-            # Use the identified drone model's physical width when available.
-            # Fall back to the existing generic profile if classification is UNKNOWN.
-            identified_width = get_drone_width(target_kin.cached_type)
-
-            if identified_width is not None:
-                distance_profile = dict(target_nominal_profile)
-                distance_profile["width"] = identified_width
-                distance_profile["height"] = identified_width * (
-                    target_nominal_profile["height"] /
-                    max(0.001, target_nominal_profile["width"])
-                )
-            else:
-                distance_profile = target_nominal_profile
-
             z_est, sigma_d, ci_low, ci_high, crlb_var = compute_crlb_distance(
-                box_w, box_h, distance_profile, FOCAL_LENGTH_PX, SIGMA_PIXEL,
+                box_w, box_h, target_nominal_profile, FOCAL_LENGTH_PX, SIGMA_PIXEL,
                 u_center, v_center, cx_cam, cy_cam
             )
 
