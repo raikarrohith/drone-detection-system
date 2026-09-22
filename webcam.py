@@ -681,11 +681,10 @@ while True:
             x_3d = ((u_center - cx_cam) * z_est) / FOCAL_LENGTH_PX
             y_3d = ((v_center - cy_cam) * z_est) / FOCAL_LENGTH_PX
 
-            # Update Kinematics with Adaptive CRLB Kalman State Estimator (Derivation 3B)
-            target_kin.update(frame_count, current_time, x_3d, y_3d, z_est, sigma_d, crlb_var)
-
-            # Multi-frame Track Confirmation (instant display for low-confidence distant drones):
-            is_confirmed = (confidence >= 0.12) or (target_kin.hits >= 1)
+            # Multi-frame Track Confirmation:
+            # - High confidence (>= 0.40): immediate confirmation
+            # - Moderate/Low confidence (< 0.40): require >= 2 consecutive frames to eliminate momentary 1-frame motion glitches
+            is_confirmed = (confidence >= 0.40) or (target_kin.hits >= 2 and confidence >= 0.16)
             if is_confirmed:
                 confirmed_drone_count += 1
                 disp_z = target_kin.smoothed_z if target_kin.smoothed_z is not None else z_est
