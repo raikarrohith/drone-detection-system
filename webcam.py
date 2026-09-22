@@ -3,14 +3,21 @@ import os
 import time
 import math
 import argparse
+import json
+import csv
+from pathlib import Path
 import cv2
 import numpy as np
 from ultralytics import YOLO
-from drone_classifier import DroneTypeClassifier, get_drone_width
+from drone_classifier import (
+    DroneTypeClassifier,
+    get_drone_width,
+    get_drone_domain,
+    get_drone_dimensions,
+    DRONE_WIDTHS,
+    AIRFRAME_DOMAINS
+)
 
-# ---------------------------------------------------------
-# 1. PARSE ARGUMENTS & LOAD YOLO MODEL
-# ---------------------------------------------------------
 # ---------------------------------------------------------
 # 1. PARSE ARGUMENTS & LOAD YOLO MODEL WITH ACCELERATION
 # ---------------------------------------------------------
@@ -20,8 +27,8 @@ parser = argparse.ArgumentParser(description="Drone Defense & CRLB Distance Esti
 parser.add_argument("--video", "-v", type=str, default=None, help="Path to test video file (e.g. drone_test.mp4)")
 parser.add_argument("--camera", "-c", type=int, default=None, help="Camera index (e.g. 0, 1, 2)")
 parser.add_argument("--imgsz", type=int, default=960, help="Inference resolution: 960 (balanced long-range) or 1280/640")
-parser.add_argument("--type-model", type=str, default="models/drone_type_classifier.pt", help="Optional civilian/military Ultralytics classification model")
-parser.add_argument("--type-confidence", type=float, default=0.70, help="Minimum drone-type classifier confidence (0-1)")
+parser.add_argument("--type-model", type=str, default="drone_classifier/model/drone_cnn_best.pth", help="Optional civilian/military Ultralytics classification model")
+parser.add_argument("--type-confidence", type=float, default=0.45, help="Minimum drone-type classifier confidence (0-1)")
 parser.add_argument("--drone-width", type=float, default=None, help="Measured rotor-tip-to-tip span in metres; overrides the selected profile width")
 parser.add_argument("--focal-length-px", type=float, default=None, help="Calibrated focal length in pixels for the active camera resolution")
 parser.add_argument("--calibration-distance", type=float, default=None, help="Known target distance in metres; press K while the drone is detected to calibrate focal length")
@@ -30,7 +37,6 @@ args, _ = parser.parse_known_args()
 
 video_source = args.video if args.video else args.video_pos
 current_imgsz = args.imgsz
-
 
 # Auto-detect best hardware device (NVIDIA CUDA, Apple Silicon MPS, or multi-threaded CPU)
 if torch.cuda.is_available():
@@ -59,11 +65,72 @@ for cls_id, name in model.names.items():
         break
 
 # ---------------------------------------------------------
+# PERSISTENT MULTI-CAMERA CALIBRATION
+# ---------------------------------------------------------
+CALIBRATION_FILE = "models/camera_calibration.json"
+
+def get_device_profile_key(cam_idx=None, is_vid=False, vid_name=""):
+    if is_vid:
+        stem = Path(vid_name).stem if vid_name else "default_video"
+        return f"video_{stem}"
+    elif cam_idx is not None:
+        return f"camera_{cam_idx}"
+    return "camera_default"
+
+def load_camera_calibration(device_key):
+    if os.path.exists(CALIBRATION_FILE):
+        try:
+            with open(CALIBRATION_FILE, "r") as f:
+                data = json.load(f)
+                cameras_dict = data.get("cameras", {})
+                if device_key in cameras_dict:
+                    cam_entry = cameras_dict[device_key]
+                    f_val = float(cam_entry.get("focal_length_px", 850.0))
+                    print(f"[*] Loaded Calibration for [{device_key}]: F = {f_val:.1f}px")
+                    return f_val
+                elif "focal_length_px" in data:
+                    f_val = float(data["focal_length_px"])
+                    print(f"[*] Loaded Default Calibration: F = {f_val:.1f}px")
+                    return f_val
+        except Exception as e:
+            print(f"[!] Warning reading camera calibration: {e}")
+    return None
+
+def save_camera_calibration(device_key, focal_len, calib_dist=None, target_width=None, resolution="1920x1080"):
+    try:
+        os.makedirs(os.path.dirname(CALIBRATION_FILE) or ".", exist_ok=True)
+        data = {"cameras": {}}
+        if os.path.exists(CALIBRATION_FILE):
+            try:
+                with open(CALIBRATION_FILE, "r") as f:
+                    existing = json.load(f)
+                    if "cameras" in existing:
+                        data["cameras"] = existing["cameras"]
+            except Exception:
+                pass
+                
+        data["cameras"][device_key] = {
+            "focal_length_px": round(float(focal_len), 2),
+            "resolution": resolution,
+            "calibrated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "calibration_distance_m": calib_dist,
+            "target_width_m": target_width
+        }
+        with open(CALIBRATION_FILE, "w") as f:
+            json.dump(data, f, indent=4)
+        print(f"[*] Saved Calibration for [{device_key}] to {CALIBRATION_FILE}: F = {focal_len:.1f}px")
+        return True
+    except Exception as e:
+        print(f"[!] Error saving calibration: {e}")
+        return False
+
+# ---------------------------------------------------------
 # 2. SOURCE SETUP (Zero-Latency Live Camera & Video Stream)
 # ---------------------------------------------------------
 cap = None
 is_video_file = False
 video_filename = ""
+active_cam_idx = None
 is_paused = False
 
 if video_source and os.path.isfile(video_source):
@@ -85,13 +152,9 @@ if cap is None or not cap.isOpened():
         if not temp_cap.isOpened():
             temp_cap = cv2.VideoCapture(cam_idx)
         if temp_cap.isOpened():
-            # Hardware acceleration: Zero-latency buffer & fast MJPEG codec
             try:
                 temp_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
                 temp_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                # Prefer 1080p on external cameras to retain more pixels for
-                # small, distant targets; cameras that cannot provide it fall
-                # back to their closest supported mode.
                 temp_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
                 temp_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
                 temp_cap.set(cv2.CAP_PROP_FPS, 30)
@@ -102,6 +165,7 @@ if cap is None or not cap.isOpened():
             ret, test_frame = temp_cap.read()
             if ret and test_frame is not None:
                 cap = temp_cap
+                active_cam_idx = cam_idx
                 print(f"[*] Successfully connected to Live Camera (index {cam_idx}) at Zero-Latency Buffer")
                 break
             else:
@@ -114,15 +178,19 @@ if cap is None or not cap.isOpened():
 WINDOW_NAME = "Drone Defense System - CRLB Range & Kinematics Engine"
 cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
 
+# Determine Active Device Calibration Key
+ACTIVE_DEVICE_KEY = get_device_profile_key(active_cam_idx, is_video_file, video_filename)
+
 # ---------------------------------------------------------
 # 3. CRAMER-RAO LOWER BOUND (CRLB) & PHYSICAL TARGET MODELS
 # ---------------------------------------------------------
-# Camera Optical Model: Focal length in pixels (calibrated for standard ~80 deg HFOV at 1080p/720p)
-FOCAL_LENGTH_PX = 850.0    # Updated dynamically based on frame width
+# Camera Optical Model: Focal length in pixels
+saved_focal_len = load_camera_calibration(ACTIVE_DEVICE_KEY)
+calibrated_focal_length_px = args.focal_length_px if args.focal_length_px is not None else saved_focal_len
+FOCAL_LENGTH_PX = calibrated_focal_length_px if calibrated_focal_length_px is not None else 850.0
 SIGMA_PIXEL = 2.5          # Realistic YOLO bounding box edge regression noise std-dev (pixels)
 POSE_ASPECT_RATIO_UNCERTAINTY = 0.045  # 4.5% standard error due to 3D drone yaw/pitch rotation
-CALIBRATION_RELATIVE_UNCERTAINTY = 0.10  # Calibration/model uncertainty; prevents falsely precise CRLB output
-
+CALIBRATION_RELATIVE_UNCERTAINTY = 0.05 if calibrated_focal_length_px is not None else 0.10
 
 # Drone Physical Size Profiles (Wingspan, Height, and Diagonal in meters)
 DRONE_PROFILES = {
@@ -238,36 +306,23 @@ def is_hollow_eyeglasses(crop_bgr):
 
 def is_human_or_face_false_positive(crop_bgr, aspect_ratio, confidence):
     """
-    Discriminates humans, faces, and moving heads/bodies from airborne drones.
-    - Dual HSV + YCrCb chrominance detects human skin across complexions and lighting.
-    - Rejects moving heads, faces, and nearby humans while preserving hand-held and flying drones.
+    Discriminates tall standing humans and close-up faces while preserving distant drones.
     """
     if crop_bgr is None or crop_bgr.size == 0:
         return False
         
-    # 1. Reject vertically elongated shapes (faces, standing/sitting humans) unless exceptionally high confidence
-    if aspect_ratio < 0.95 and confidence < 0.65:
-        return True
-        
-    # 2. Dual HSV + YCrCb Chromaticity Skin Analysis
-    hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
-    ycrcb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2YCrCb)
-    
-    mask_hsv1 = cv2.inRange(hsv, np.array([0, 25, 45]), np.array([25, 255, 255]))
-    mask_hsv2 = cv2.inRange(hsv, np.array([170, 25, 45]), np.array([180, 255, 255]))
-    mask_hsv = cv2.bitwise_or(mask_hsv1, mask_hsv2)
-    
-    mask_ycrcb = cv2.inRange(ycrcb, np.array([0, 130, 75]), np.array([255, 180, 135]))
-    skin_mask = cv2.bitwise_and(mask_hsv, mask_ycrcb)
-    skin_ratio = np.count_nonzero(skin_mask) / max(1, skin_mask.size)
-    
-    # Moving face / head / skin signature: contains > 12% skin tone
-    if skin_ratio > 0.12:
-        return True
-        
-    # Low confidence on near-square object with any noticeable skin presence
-    if aspect_ratio < 1.25 and skin_ratio > 0.07 and confidence < 0.45:
-        return True
+    # Only reject distinctly tall vertical objects (standing human / vertical face)
+    if aspect_ratio < 0.70 and confidence < 0.50:
+        hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
+        ycrcb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2YCrCb)
+        mask_hsv1 = cv2.inRange(hsv, np.array([0, 25, 45]), np.array([25, 255, 255]))
+        mask_hsv2 = cv2.inRange(hsv, np.array([170, 25, 45]), np.array([180, 255, 255]))
+        mask_hsv = cv2.bitwise_or(mask_hsv1, mask_hsv2)
+        mask_ycrcb = cv2.inRange(ycrcb, np.array([0, 130, 75]), np.array([255, 180, 135]))
+        skin_mask = cv2.bitwise_and(mask_hsv, mask_ycrcb)
+        skin_ratio = np.count_nonzero(skin_mask) / max(1, skin_mask.size)
+        if skin_ratio > 0.35:
+            return True
         
     return False
 
@@ -332,26 +387,38 @@ class TargetKinematics:
         self.speed_kmh = 0.0
         self.approach_rate = 0.0  # m/s (+ approaching, - receding)
         self.eta_seconds = None
-        self.type_votes = {"CIVILIAN": 0.0, "MILITARY": 0.0}
+        self.type_votes = {}
         self.cached_type = "UNKNOWN"
+        self.cached_domain = "UNKNOWN"
         self.cached_type_score = 0.0
+        self.auto_profile = None
         self.last_classified_frame = -10
 
-    def update_type(self, label, confidence):
-        """Smooth classifications over a track to avoid frame-to-frame flicker."""
-        for known_label in self.type_votes:
-            self.type_votes[known_label] *= 0.88
-        if label in self.type_votes:
-            self.type_votes[label] += confidence
+    def update_type(self, label, confidence, aspect_ratio=2.0):
+        """Smooth classifications over a track and dynamically auto-calibrate dimensions."""
+        for k in list(self.type_votes.keys()):
+            self.type_votes[k] *= 0.88
+            
+        if label and label != "UNKNOWN":
+            self.type_votes[label] = self.type_votes.get(label, 0.0) + confidence
 
-        label, score = max(self.type_votes.items(), key=lambda item: item[1])
-        if score >= 0.90:
-            self.cached_type = label
-            self.cached_type_score = min(0.99, score / (score + 0.35))
+        if self.type_votes:
+            best_label, score = max(self.type_votes.items(), key=lambda item: item[1])
+            if score >= 0.70:
+                self.cached_type = best_label
+                self.cached_domain = get_drone_domain(best_label)
+                self.cached_type_score = min(0.99, score / (score + 0.30))
+            else:
+                self.cached_type = "UNKNOWN"
+                self.cached_domain = "UNKNOWN"
+                self.cached_type_score = 0.0
         else:
             self.cached_type = "UNKNOWN"
+            self.cached_domain = "UNKNOWN"
             self.cached_type_score = 0.0
-        return self.cached_type, self.cached_type_score
+
+        self.auto_profile = get_drone_dimensions(self.cached_type, aspect_ratio=aspect_ratio)
+        return self.cached_type, self.cached_type_score, self.auto_profile
 
     def update(self, frame_num, timestamp, x_m, y_m, z_m, sigma_d, crlb_variance):
         self.hits += 1
@@ -439,8 +506,23 @@ print("=" * 65 + "\n")
 # 5. MAIN REAL-TIME ESTIMATION & TRACKING LOOP
 # ---------------------------------------------------------
 current_frame = None
-calibrated_focal_length_px = args.focal_length_px
 latest_box_width = None
+latest_target_width = target_nominal_profile["width"]
+calib_status_text = f"Loaded F={FOCAL_LENGTH_PX:.1f}px from file" if saved_focal_len else ""
+calib_status_expiry = time.time() + 3.0 if saved_focal_len else 0
+
+# Setup Telemetry Logging Directory
+telemetry_dir = Path("flight_logs")
+telemetry_dir.mkdir(parents=True, exist_ok=True)
+telemetry_csv_path = telemetry_dir / "telemetry.csv"
+if not telemetry_csv_path.exists():
+    with open(telemetry_csv_path, "w", newline="") as f_csv:
+        writer = csv.writer(f_csv)
+        writer.writerow([
+            "timestamp", "frame", "track_id", "confidence", "airframe_type",
+            "domain", "type_conf", "span_m", "x_m", "y_m", "distance_m",
+            "crlb_sigma_m", "speed_kmh", "approach_rate_mps", "eta_s"
+        ])
 
 while True:
     if not is_paused or current_frame is None:
@@ -477,11 +559,10 @@ while True:
     h, w, _ = frame.shape
     cx_cam = w / 2.0
     cy_cam = h / 2.0
-    FOCAL_LENGTH_PX = (
-        calibrated_focal_length_px
-        if calibrated_focal_length_px is not None
-        else (w / 1280.0) * 850.0
-    )
+    if calibrated_focal_length_px is not None:
+        FOCAL_LENGTH_PX = calibrated_focal_length_px
+    else:
+        FOCAL_LENGTH_PX = (w / 1280.0) * 850.0
 
     conf_threshold = conf_percent / 100.0
 
@@ -498,7 +579,7 @@ while True:
     )
 
     confirmed_drone_count = 0
-    telemetry_records = []  # Digital Twin telemetry stream container
+    telemetry_records = []
 
     for result in results:
         boxes = result.boxes
@@ -517,36 +598,24 @@ while True:
             box_w, box_h = (x2 - x1), (y2 - y1)
             aspect_ratio = float(box_w) / max(1.0, float(box_h))
             latest_box_width = max(2, box_w)
-            aspect_ratio = float(box_w) / max(1.0, float(box_h))
             char_dim = max(box_w, box_h)
 
-            # 1. Clutter & Eyeglasses Rejection Filter:
-            # - Eyeglasses flat on desk have extreme horizontal aspect ratios (> 2.85) and thin vertical frames.
-            # - Quadcopters (Profiles 1-3) can range between 0.35 and 2.6 when viewed in hand/desk at angles.
-            # - Fixed-wings (Profile 4) can have wide wingspans up to 3.8.
-            if active_profile_id != 4:  # For Multirotors (Mini 24cm, Standard 38cm, Heavy 75cm)
-                if (aspect_ratio > 2.85 or aspect_ratio < 0.28) and confidence < 0.45:
-                    continue
-                if aspect_ratio > 3.6:  # Strictly reject extreme slivers (eyeglasses flat on desk)
-                    continue
-            else:  # Tactical Fixed-Wing Profile
-                if (aspect_ratio > 4.0 or aspect_ratio < 0.22) and confidence < 0.40:
-                    continue
-
-            # 2. Filter massive screen-filling objects (laptops, walls taking > 60% of screen)
+            # 1. Clutter Rejection Filter (extreme slivers)
+            if aspect_ratio > 4.2 and confidence < 0.60:
+                continue
             if (box_w * box_h) > (0.60 * w * h):
                 continue
 
-            # 3. Optical Hollow-Lens & Human / Face Rejection Filter:
+            # 2. Optical Hollow-Lens & Tall Human Rejection Filter:
             crop = frame[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
             if is_hollow_eyeglasses(crop):
                 continue
             if is_human_or_face_false_positive(crop, aspect_ratio, confidence):
                 continue
 
-            # Anti-glitch persistence
+            # Fallback track ID when ByteTrack doesn't immediately assign one
             if track_id is None:
-                continue
+                track_id = 1
 
             if track_id not in tracks_db:
                 tracks_db[track_id] = TargetKinematics(track_id)
@@ -556,21 +625,25 @@ while True:
             u_center = (x1 + x2) / 2.0
             v_center = (y1 + y2) / 2.0
 
-            # Compute Multi-Cue Fused Monocular Distance & CRLB (Derivations 1, 2, 3A)
-            # Use the identified drone model's physical width when available.
-            # Fall back to the existing generic profile if classification is UNKNOWN.
-            identified_width = get_drone_width(target_kin.cached_type)
-
-            if identified_width is not None:
-                distance_profile = dict(target_nominal_profile)
-                distance_profile["width"] = identified_width
-                distance_profile["height"] = identified_width * (
-                    target_nominal_profile["height"] /
-                    max(0.001, target_nominal_profile["width"])
-                )
+            # 3. Dynamic Airframe Classification & Auto-Profile Resolution (NO MANUAL KEYS REQUIRED)
+            if type_classifier.enabled and (target_kin.cached_type == "UNKNOWN" or (frame_count - target_kin.last_classified_frame >= 6)):
+                if crop.size > 0:
+                    frame_type, frame_type_conf = type_classifier.classify(crop, device=DEVICE)
+                    target_kin.last_classified_frame = frame_count
+                    drone_type, drone_type_score, auto_prof = target_kin.update_type(frame_type, frame_type_conf, aspect_ratio=aspect_ratio)
+                else:
+                    drone_type, drone_type_score, auto_prof = target_kin.cached_type, target_kin.cached_type_score, target_kin.auto_profile
             else:
-                distance_profile = target_nominal_profile
+                drone_type, drone_type_score, auto_prof = target_kin.cached_type, target_kin.cached_type_score, target_kin.auto_profile
 
+            if auto_prof is None:
+                auto_prof = get_drone_dimensions(drone_type, aspect_ratio=aspect_ratio)
+
+            # Auto-calibrated physical dimension profile for this specific target
+            distance_profile = auto_prof
+            latest_target_width = distance_profile["width"]
+
+            # Compute Multi-Cue Fused Monocular Distance & CRLB (Derivations 1, 2, 3A)
             z_est, sigma_d, ci_low, ci_high, crlb_var = compute_crlb_distance(
                 box_w, box_h, distance_profile, FOCAL_LENGTH_PX, SIGMA_PIXEL,
                 u_center, v_center, cx_cam, cy_cam
@@ -582,28 +655,13 @@ while True:
             # Update Kinematics with Adaptive CRLB Kalman State Estimator (Derivation 3B)
             target_kin.update(frame_count, current_time, x_3d, y_3d, z_est, sigma_d, crlb_var)
 
-            # Efficient Drone Type Classifier:
-            # Query classifier on first detection or periodically every 6 frames to preserve maximum FPS
-            if type_classifier.enabled and (target_kin.cached_type == "UNKNOWN" or (frame_count - target_kin.last_classified_frame >= 6)):
-                crop = frame[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
-                if crop.size > 0:
-                    frame_type, frame_type_conf = type_classifier.classify(crop, device=DEVICE)
-                    target_kin.last_classified_frame = frame_count
-                    drone_type, drone_type_score = target_kin.update_type(frame_type, frame_type_conf)
-                else:
-                    drone_type, drone_type_score = target_kin.cached_type, target_kin.cached_type_score
-            else:
-                drone_type, drone_type_score = target_kin.cached_type, target_kin.cached_type_score
-
-            # Multi-frame Track Confirmation & Anti-Face-Glitch:
-            # - High confidence (>= 0.38): immediate confirmation
-            # - Moderate/Low confidence (< 0.38): require >= 2 consecutive frames to eliminate momentary 1-frame face blips
-            is_confirmed = (confidence >= 0.38) or (target_kin.hits >= 2)
+            # Multi-frame Track Confirmation (instant display for low-confidence distant drones):
+            is_confirmed = (confidence >= 0.12) or (target_kin.hits >= 1)
             if is_confirmed:
                 confirmed_drone_count += 1
                 disp_z = target_kin.smoothed_z if target_kin.smoothed_z is not None else z_est
 
-                # Record Telemetry for Digital Twin
+                # Record Telemetry for Digital Twin & Flight Log
                 telemetry_records.append({
                     "track_id": track_id,
                     "confidence": confidence,
@@ -613,33 +671,35 @@ while True:
                     "speed_kmh": target_kin.speed_kmh,
                     "approach_rate": target_kin.approach_rate,
                     "eta_s": target_kin.eta_seconds,
-                    "drone_type": drone_type.lower(),
+                    "drone_type": drone_type,
+                    "domain": target_kin.cached_domain,
                     "drone_type_confidence": drone_type_score,
+                    "span_m": distance_profile["width"],
                     "bbox": [x1, y1, x2, y2]
                 })
 
-                # Threat Zone Color Coding by Distance
-                if disp_z < 10.0:
-                    box_color = (0, 0, 255)       # Red: Critical Proximity
-                    zone_str = "CRITICAL"
+                # Threat Zone Color Coding by Domain & Distance
+                if target_kin.cached_domain == "MILITARY" or disp_z < 10.0:
+                    box_color = (0, 0, 255)       # Red: High Threat / Critical Proximity
+                    zone_str = "MILITARY THREAT" if target_kin.cached_domain == "MILITARY" else "CRITICAL RANGE"
                 elif disp_z < 25.0:
-                    box_color = (0, 165, 255)     # Orange: Tactical Range
-                    zone_str = "CAUTION"
+                    box_color = (0, 165, 255)     # Orange: Tactical Caution
+                    zone_str = f"{target_kin.cached_domain} CAUTION"
                 else:
-                    box_color = (0, 255, 0)       # Green: Long Range
-                    zone_str = "TRACKING"
+                    box_color = (0, 255, 0)       # Green: Airspace Tracking
+                    zone_str = f"{target_kin.cached_domain} TRACKING"
 
                 # Draw Target Box & Corner Reticles
                 cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
                 corner_len = max(8, min(24, box_w // 3, box_h // 3))
                 cv2.line(frame, (x1, y1), (x1 + corner_len, y1), (0, 255, 255), 3)
-                cv2.line(frame, (x1, y1), (x1 + corner_len, y1), (0, 255, 255), 3)
+                cv2.line(frame, (x1, y1), (x1, y1 + corner_len), (0, 255, 255), 3)
                 cv2.line(frame, (x2, y1), (x2 - corner_len, y1), (0, 255, 255), 3)
-                cv2.line(frame, (x2, y1), (x2 - corner_len, y1), (0, 255, 255), 3)
+                cv2.line(frame, (x2, y1), (x2, y1 + corner_len), (0, 255, 255), 3)
                 cv2.line(frame, (x1, y2), (x1 + corner_len, y2), (0, 255, 255), 3)
-                cv2.line(frame, (x1, y2), (x1 - corner_len, y2), (0, 255, 255), 3)
+                cv2.line(frame, (x1, y2), (x1, y2 - corner_len), (0, 255, 255), 3)
                 cv2.line(frame, (x2, y2), (x2 - corner_len, y2), (0, 255, 255), 3)
-                cv2.line(frame, (x2, y2), (x2 - corner_len, y2), (0, 255, 255), 3)
+                cv2.line(frame, (x2, y2), (x2, y2 - corner_len), (0, 255, 255), 3)
 
                 # Center Reticle Target Point
                 cv2.circle(frame, (int(u_center), int(v_center)), 4, (0, 255, 255), -1)
@@ -655,24 +715,24 @@ while True:
                     err_str = f"+/-{sigma_d:.2f}m"
                     ci_str = f"{ci_low:.1f}-{ci_high:.1f}m"
                     
-                line2 = f"DIST: {disp_z:.2f}m [CRLB: {err_str} (95% CI: {ci_str})]"
-                type_confidence_text = f" {drone_type_score:.0%}" if drone_type != "UNKNOWN" else ""
-                line2 = f"TYPE: {drone_type}{type_confidence_text} | " + line2
+                type_confidence_text = f" ({drone_type_score:.0%})" if drone_type != "UNKNOWN" else ""
+                line2 = f"AIRFRAME: {drone_type}{type_confidence_text} | SPAN: {distance_profile['width']*100:.0f}cm (AUTO)"
+                line3 = f"DIST: {disp_z:.2f}m [CRLB: {err_str} (95% CI: {ci_str})]"
                 
                 # Approach vector text
                 if target_kin.approach_rate > 0.8:
                     eta_str = f"ETA: {target_kin.eta_seconds:.1f}s" if target_kin.eta_seconds else ""
-                    line3 = f"VEL: {target_kin.speed_kmh:.1f}km/h (CLOSING @ +{target_kin.approach_rate:.1f}m/s {eta_str})"
-                    line3_color = (0, 255, 255)
+                    line4 = f"VEL: {target_kin.speed_kmh:.1f}km/h (CLOSING @ +{target_kin.approach_rate:.1f}m/s {eta_str})"
+                    line4_color = (0, 255, 255)
                 elif target_kin.approach_rate < -0.8:
-                    line3 = f"VEL: {target_kin.speed_kmh:.1f}km/h (RECEDING @ {target_kin.approach_rate:.1f}m/s)"
-                    line3_color = (180, 255, 180)
+                    line4 = f"VEL: {target_kin.speed_kmh:.1f}km/h (RECEDING @ {target_kin.approach_rate:.1f}m/s)"
+                    line4_color = (180, 255, 180)
                 else:
-                    line3 = f"VEL: {target_kin.speed_kmh:.1f}km/h (HOVER / LATERAL)"
-                    line3_color = (220, 220, 220)
+                    line4 = f"VEL: {target_kin.speed_kmh:.1f}km/h (HOVER / LATERAL)"
+                    line4_color = (220, 220, 220)
 
-                badge_w = max(420, int(box_w + 80))
-                badge_h = 58
+                badge_w = max(460, int(box_w + 100))
+                badge_h = 74
                 badge_y1 = max(0, y1 - badge_h - 6)
                 badge_y2 = y1 - 6
 
@@ -684,7 +744,23 @@ while True:
 
                 cv2.putText(frame, line1, (x1 + 6, badge_y1 + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (255, 255, 255), 1, cv2.LINE_AA)
                 cv2.putText(frame, line2, (x1 + 6, badge_y1 + 33), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1, cv2.LINE_AA)
-                cv2.putText(frame, line3, (x1 + 6, badge_y1 + 50), cv2.FONT_HERSHEY_SIMPLEX, 0.40, line3_color, 1, cv2.LINE_AA)
+                cv2.putText(frame, line3, (x1 + 6, badge_y1 + 50), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 255, 0), 1, cv2.LINE_AA)
+                cv2.putText(frame, line4, (x1 + 6, badge_y1 + 67), cv2.FONT_HERSHEY_SIMPLEX, 0.38, line4_color, 1, cv2.LINE_AA)
+
+    # Periodic Telemetry CSV Append
+    if telemetry_records and frame_count % 3 == 0:
+        with open(telemetry_csv_path, "a", newline="") as f_csv:
+            writer = csv.writer(f_csv)
+            for rec in telemetry_records:
+                writer.writerow([
+                    time.strftime("%Y-%m-%d %H:%M:%S"), frame_count, rec["track_id"],
+                    f"{rec['confidence']:.2f}", rec["drone_type"], rec["domain"],
+                    f"{rec['drone_type_confidence']:.2f}", f"{rec['span_m']:.2f}",
+                    f"{rec['position_3d'][0]:.2f}", f"{rec['position_3d'][1]:.2f}",
+                    f"{rec['position_3d'][2]:.2f}", f"{rec['crlb_sigma']:.2f}",
+                    f"{rec['speed_kmh']:.1f}", f"{rec['approach_rate']:.1f}",
+                    f"{rec['eta_s']:.1f}" if rec["eta_s"] else ""
+                ])
 
     # Stale track cleanup
     stale_ids = [tid for tid, obj in tracks_db.items() if frame_count - obj.last_frame > MAX_MISSED_FRAMES]
@@ -697,18 +773,18 @@ while True:
     header_color = (0, 0, 180) if confirmed_drone_count > 0 else (30, 30, 30)
     cv2.rectangle(frame, (0, 0), (w, 42), header_color, -1)
     
-    status_msg = f"AIRSPACE ALERT: {confirmed_drone_count} ACTIVE TARGET(S)" if confirmed_drone_count > 0 else "AIRSPACE SURVEILLANCE: SCANNING (CRLB ACTIVE)"
-    cv2.putText(frame, status_msg, (15, 28), cv2.FONT_HERSHEY_DUPLEX, 0.65, (0, 255, 255) if confirmed_drone_count > 0 else (0, 255, 0), 2, cv2.LINE_AA)
+    status_msg = f"AIRSPACE ALERT: {confirmed_drone_count} ACTIVE TARGET(S)" if confirmed_drone_count > 0 else "AIRSPACE SURVEILLANCE: SCANNING (CRLB AUTO-PROFILE ACTIVE)"
+    cv2.putText(frame, status_msg, (15, 28), cv2.FONT_HERSHEY_DUPLEX, 0.62, (0, 255, 255) if confirmed_drone_count > 0 else (0, 255, 0), 2, cv2.LINE_AA)
 
-    profile_name = DRONE_PROFILES[active_profile_id]["name"]
-    source_tag = f"VID: {video_filename}" if is_video_file else f"Ref: {profile_name} ({target_nominal_width*100:.0f}cm)"
+    calib_tag = f"CALIB: F={FOCAL_LENGTH_PX:.0f}px"
+    source_tag = f"VID: {video_filename}" if is_video_file else f"CAM (1080p)"
     pause_tag = " [PAUSED]" if is_paused else ""
-    header_right = f"{source_tag}{pause_tag} | FPS: {fps:.1f}"
-    (rw, _), _ = cv2.getTextSize(header_right, cv2.FONT_HERSHEY_SIMPLEX, 0.46, 1)
-    cv2.putText(frame, header_right, (w - rw - 15, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (220, 220, 220), 1, cv2.LINE_AA)
+    header_right = f"{source_tag} | {calib_tag}{pause_tag} | FPS: {fps:.1f}"
+    (rw, _), _ = cv2.getTextSize(header_right, cv2.FONT_HERSHEY_SIMPLEX, 0.44, 1)
+    cv2.putText(frame, header_right, (w - rw - 15, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (220, 220, 220), 1, cv2.LINE_AA)
 
     # ---------------------------------------------------------
-    # 7. BOTTOM TACTICAL FOOTER HUD (Sensitivity & CRLB Controls)
+    # 7. BOTTOM TACTICAL FOOTER HUD (Sensitivity & Calibration)
     # ---------------------------------------------------------
     footer_h = 46
     cv2.rectangle(frame, (0, h - footer_h), (w, h), (20, 20, 20), -1)
@@ -731,15 +807,25 @@ while True:
 
     cv2.putText(frame, f"{conf_percent}%", (SLIDER_X2 + 12, h - 17), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 1, cv2.LINE_AA)
 
-    # Key helpers & Profile selector prompt
+    # Key helpers prompt
     if is_video_file:
-        controls_msg = "Profiles [1-4] | [SPACE]: Pause/Play | [R]: Replay | Mode: [T] | Quit: Q"
+        controls_msg = "[K]: Calib Focal | [SPACE]: Pause | [R]: Replay | Mode: [T] | Quit: Q"
     else:
         clahe_tag = "[ON]" if clahe_enabled else ""
-        controls_msg = f"Profiles [1-4] | Mode: [T] | Contrast: [C]{clahe_tag} | Sens: [ / ] | Quit: Q"
+        controls_msg = f"[K]: Calib Focal | Contrast: [C]{clahe_tag} | Mode: [T] | Sens: [ / ] | Quit: Q"
         
     (cw, _), _ = cv2.getTextSize(controls_msg, cv2.FONT_HERSHEY_SIMPLEX, 0.40, 1)
     cv2.putText(frame, controls_msg, (w - cw - 15, h - 17), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (180, 180, 180), 1, cv2.LINE_AA)
+
+    # Calibration Status Banner Overlay
+    if calib_status_text and time.time() < calib_status_expiry:
+        banner_w = 480
+        banner_h = 32
+        bx1 = (w - banner_w) // 2
+        by1 = h - footer_h - banner_h - 10
+        cv2.rectangle(frame, (bx1, by1), (bx1 + banner_w, by1 + banner_h), (0, 100, 0), -1)
+        cv2.rectangle(frame, (bx1, by1), (bx1 + banner_w, by1 + banner_h), (0, 255, 0), 2)
+        cv2.putText(frame, calib_status_text, (bx1 + 15, by1 + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
 
     cv2.imshow(WINDOW_NAME, frame)
 
@@ -768,27 +854,23 @@ while True:
     elif key in (ord("1"), ord("2"), ord("3"), ord("4")):
         active_profile_id = int(chr(key))
         target_nominal_profile = DRONE_PROFILES[active_profile_id]
-        if args.drone_width is not None:
-            profile_ratio = target_nominal_profile["height"] / target_nominal_profile["width"]
-            target_nominal_profile = {
-                **target_nominal_profile,
-                "name": "Measured Drone",
-                "width": args.drone_width,
-                "height": args.drone_width * profile_ratio,
-                "desc": f"Measured width ({args.drone_width * 100:.1f}cm)",
-            }
         target_nominal_width = target_nominal_profile["width"]
-        print(f"[*] Switched Drone Size Profile: {DRONE_PROFILES[active_profile_id]['desc']}")
+        print(f"[*] Switched Drone Size Override Profile: {DRONE_PROFILES[active_profile_id]['desc']}")
     elif key in (ord("k"), ord("K")):
-        if args.calibration_distance is None:
-            print("[!] Start with --calibration-distance <known metres> to use [K] calibration.")
-        elif latest_box_width is None:
-            print("[!] No drone box is available yet; keep the drone visible and press [K] again.")
+        # Auto-Calibrate Focal Length and Save Persistently for Active Camera Profile
+        calib_dist = args.calibration_distance if args.calibration_distance is not None else 1.0
+        if latest_box_width is None:
+            print("[!] No drone bounding box visible. Keep target in frame and press [K].")
+            calib_status_text = "ERROR: No Target Box Visible to Calibrate"
+            calib_status_expiry = time.time() + 3.0
         else:
-            calibrated_focal_length_px = (
-                latest_box_width * args.calibration_distance / target_nominal_profile["width"]
-            )
-            print(f"[*] Focal length calibrated: {calibrated_focal_length_px:.1f}px at {args.calibration_distance:.2f}m")
+            calibrated_focal_length_px = (latest_box_width * calib_dist) / max(0.05, float(latest_target_width))
+            FOCAL_LENGTH_PX = calibrated_focal_length_px
+            res_str = f"{w}x{h}"
+            save_camera_calibration(ACTIVE_DEVICE_KEY, calibrated_focal_length_px, calib_dist, latest_target_width, resolution=res_str)
+            calib_status_text = f"SAVED [{ACTIVE_DEVICE_KEY}]: F = {calibrated_focal_length_px:.1f}px ({res_str})"
+            calib_status_expiry = time.time() + 4.0
+            print(f"[*] Camera Focal Length Calibrated & Saved for [{ACTIVE_DEVICE_KEY}]: {calibrated_focal_length_px:.1f}px")
     elif key in (ord("+"), ord("="), ord("]"), 0, 82):
         conf_percent = min(95, conf_percent + 5)
     elif key in (ord("-"), ord("_"), ord("["), 1, 84):
@@ -800,3 +882,4 @@ while True:
 
 cap.release()
 cv2.destroyAllWindows()
+

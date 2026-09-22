@@ -146,7 +146,7 @@ class DroneTypeClassifier:
             return UNKNOWN, 0.0
 
 # Approximate physical widths in metres.
-# Used by the temporary distance estimator until camera calibration.
+# Used by the auto-profile distance estimator.
 DRONE_WIDTHS = {
     "DJI-Mavic": 0.35,
     "DJI-Phantom": 0.35,
@@ -158,5 +158,43 @@ DRONE_WIDTHS = {
     "Yuneec-Typhoon": 0.54,
 }
 
+AIRFRAME_DOMAINS = {
+    "DJI-Mavic": "CIVILIAN",
+    "DJI-Phantom": "CIVILIAN",
+    "Parrot_Bebop": "CIVILIAN",
+    "Yuneec-Typhoon": "CIVILIAN",
+    "RQ11-Raven": "MILITARY",
+    "RQ7-Shadow": "MILITARY",
+    "Predator-Reaper": "MILITARY",
+    "RQ4-GlobalHawk": "MILITARY",
+}
+
 def get_drone_width(drone_type):
     return DRONE_WIDTHS.get(drone_type)
+
+def get_drone_domain(drone_type):
+    return AIRFRAME_DOMAINS.get(drone_type, "UNKNOWN")
+
+def get_drone_dimensions(drone_type, aspect_ratio=2.0):
+    """
+    Returns auto-calibrated physical width and height for distance estimation.
+    If the type is unknown, estimates based on morphological aspect ratio.
+    """
+    if drone_type in DRONE_WIDTHS:
+        w = DRONE_WIDTHS[drone_type]
+        domain = AIRFRAME_DOMAINS.get(drone_type, "UNKNOWN")
+        # Fixed wing models have different height ratio compared to multirotors
+        if domain == "MILITARY" or w > 1.0:
+            h = w * 0.25
+        else:
+            h = w * 0.37
+        return {"name": drone_type, "width": w, "height": h, "domain": domain, "auto": True}
+    
+    # Morphological fallback when type is UNKNOWN
+    if aspect_ratio >= 2.8:
+        return {"name": "Tactical Wing (Auto)", "width": 1.37, "height": 0.35, "domain": "UNKNOWN", "auto": True}
+    elif aspect_ratio >= 1.6:
+        return {"name": "Standard Quad (Auto)", "width": 0.38, "height": 0.14, "domain": "UNKNOWN", "auto": True}
+    else:
+        return {"name": "Micro Mini (Auto)", "width": 0.24, "height": 0.08, "domain": "UNKNOWN", "auto": True}
+
