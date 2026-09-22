@@ -52,6 +52,22 @@ else:
 
 MODEL_PATH = "models/best.pt"
 model = YOLO(MODEL_PATH)
+
+# Detect if 4-Head P2 Tiny-Object Architecture is active
+is_p2_model = False
+try:
+    if hasattr(model.model, "model"):
+        detect_head = model.model.model[-1]
+        if hasattr(detect_head, "nl") and detect_head.nl == 4:
+            is_p2_model = True
+except Exception:
+    pass
+
+if is_p2_model:
+    print("[*] Detector Architecture: 4-Head P2 Tiny-Object Detection Engine (Stride 4 ACTIVE)")
+else:
+    print("[*] Detector Architecture: Standard 3-Head YOLO (Stride 8-32)")
+
 type_classifier = DroneTypeClassifier(args.type_model, args.type_confidence)
 if type_classifier.enabled:
     print(f"[*] Drone Type Classifier: {args.type_model} (threshold {args.type_confidence:.0%})")
@@ -779,7 +795,8 @@ while True:
     calib_tag = f"CALIB: F={FOCAL_LENGTH_PX:.0f}px"
     source_tag = f"VID: {video_filename}" if is_video_file else f"CAM (1080p)"
     pause_tag = " [PAUSED]" if is_paused else ""
-    header_right = f"{source_tag} | {calib_tag}{pause_tag} | FPS: {fps:.1f}"
+    p2_tag = " | P2-HEAD" if is_p2_model else ""
+    header_right = f"{source_tag} | {calib_tag}{p2_tag}{pause_tag} | FPS: {fps:.1f}"
     (rw, _), _ = cv2.getTextSize(header_right, cv2.FONT_HERSHEY_SIMPLEX, 0.44, 1)
     cv2.putText(frame, header_right, (w - rw - 15, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (220, 220, 220), 1, cv2.LINE_AA)
 
