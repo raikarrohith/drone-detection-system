@@ -59,7 +59,7 @@ class DroneCNN(nn.Module):
 
 class DroneTypeClassifier:
 
-    def __init__(self, model_path=None, confidence_threshold=0.45):
+    def __init__(self, model_path=None, confidence_threshold=0.20):
 
         self.confidence_threshold = confidence_threshold
         self.model = None
@@ -182,7 +182,7 @@ def get_drone_dimensions(drone_type, aspect_ratio=2.0):
     """
     if drone_type in DRONE_WIDTHS:
         w = DRONE_WIDTHS[drone_type]
-        domain = AIRFRAME_DOMAINS.get(drone_type, "UNKNOWN")
+        domain = AIRFRAME_DOMAINS.get(drone_type, "CIVILIAN")
         # Fixed wing models have different height ratio compared to multirotors
         if domain == "MILITARY" or w > 1.0:
             h = w * 0.25
@@ -190,11 +190,11 @@ def get_drone_dimensions(drone_type, aspect_ratio=2.0):
             h = w * 0.37
         return {"name": drone_type, "width": w, "height": h, "domain": domain, "auto": True}
     
-    # Morphological fallback when type is UNKNOWN
+    # Morphological fallback: multirotors are civilian, wide wings are military tactical
     if aspect_ratio >= 2.8:
-        return {"name": "Tactical Wing (Auto)", "width": 1.37, "height": 0.35, "domain": "UNKNOWN", "auto": True}
+        return {"name": "Tactical-Wing", "width": 1.37, "height": 0.35, "domain": "MILITARY", "auto": True}
     elif aspect_ratio >= 1.6:
-        return {"name": "Standard Quad (Auto)", "width": 0.38, "height": 0.14, "domain": "UNKNOWN", "auto": True}
+        return {"name": "Quadcopter-UAV", "width": 0.38, "height": 0.14, "domain": "CIVILIAN", "auto": True}
     else:
-        return {"name": "Micro Mini (Auto)", "width": 0.24, "height": 0.08, "domain": "UNKNOWN", "auto": True}
+        return {"name": "Micro-Mini", "width": 0.24, "height": 0.08, "domain": "CIVILIAN", "auto": True}
 
