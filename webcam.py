@@ -174,7 +174,8 @@ if cap is None or not cap.isOpened():
                 temp_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
                 temp_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
                 temp_cap.set(cv2.CAP_PROP_FPS, 30)
-                temp_cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)
+                # Anti-Blur: Configure fast shutter / exposure mode for Logitech & USB 1080p cameras
+                temp_cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 3)
             except Exception:
                 pass
 
@@ -810,7 +811,8 @@ while True:
                 # Center Reticle Target Point
                 cv2.circle(frame, (int(u_center), int(v_center)), 3, (0, 255, 255), -1)
 
-                # --- COMPACT, NON-OVERLAPPING TACTICAL HUD BADGE ---
+                # --- RESOLUTION-SCALED CRISP TACTICAL HUD BADGE ---
+                scale_res = max(0.9, w / 1280.0)
                 if sigma_d < 0.20:
                     err_str = f"+/-{sigma_d*100:.0f}cm"
                 else:
@@ -821,8 +823,8 @@ while True:
                 line1 = f"[{domain_label}] #{track_id} ({confidence*100:.0f}%) | {disp_z:.2f}m ({err_str})"
                 line2 = f"TYPE: {drone_type}{type_conf_str} | SPAN: {distance_profile['width']*100:.0f}cm"
 
-                badge_w = max(240, min(330, int(box_w + 35)))
-                badge_h = 38
+                badge_w = int(max(250, min(370, box_w + 35)) * scale_res)
+                badge_h = int(42 * scale_res)
                 
                 # Smart badge vertical positioning: if not enough room above or near top header, put below
                 if y1 - badge_h - 4 < 44:
@@ -841,8 +843,8 @@ while True:
                 cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)
                 cv2.rectangle(frame, (badge_x1, badge_y1), (badge_x2, badge_y2), box_color, 1)
 
-                cv2.putText(frame, line1, (badge_x1 + 6, badge_y1 + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.42, domain_text_color, 1, cv2.LINE_AA)
-                cv2.putText(frame, line2, (badge_x1 + 6, badge_y1 + 31), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (230, 230, 230), 1, cv2.LINE_AA)
+                cv2.putText(frame, line1, (badge_x1 + int(7 * scale_res), badge_y1 + int(18 * scale_res)), cv2.FONT_HERSHEY_SIMPLEX, 0.44 * scale_res, domain_text_color, 1, cv2.LINE_AA)
+                cv2.putText(frame, line2, (badge_x1 + int(7 * scale_res), badge_y1 + int(34 * scale_res)), cv2.FONT_HERSHEY_SIMPLEX, 0.40 * scale_res, (230, 230, 230), 1, cv2.LINE_AA)
 
     # Periodic Telemetry CSV Append
     if telemetry_records and frame_count % 3 == 0:
