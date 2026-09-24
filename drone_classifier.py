@@ -309,21 +309,70 @@ AIRFRAME_DOMAINS = {
 }
 
 
+# Verified physical dimensions (Width, Height, Diagonal in metres)
+# Used by the CRLB Fisher-Information Monocular Distance Fusion Engine
+DRONE_PHYSICAL_SPECS = {
+    # Civilian Multirotors
+    "DJI-Mavic": {"width": 0.354, "height": 0.098, "domain": "CIVILIAN"},
+    "DJI-Mavic-Air": {"width": 0.252, "height": 0.084, "domain": "CIVILIAN"},
+    "DJI-Mini": {"width": 0.245, "height": 0.056, "domain": "CIVILIAN"},
+    "DJI-Phantom": {"width": 0.350, "height": 0.190, "domain": "CIVILIAN"},
+    "DJI-Inspire": {"width": 0.580, "height": 0.300, "domain": "CIVILIAN"},
+    "DJI-Matrice": {"width": 0.880, "height": 0.420, "domain": "CIVILIAN"},
+    "DJI-FPV": {"width": 0.255, "height": 0.127, "domain": "CIVILIAN"},
+    "DJI-Avata": {"width": 0.180, "height": 0.080, "domain": "CIVILIAN"},
+    "Parrot_Bebop": {"width": 0.382, "height": 0.089, "domain": "CIVILIAN"},
+    "Parrot-Anafi": {"width": 0.240, "height": 0.065, "domain": "CIVILIAN"},
+    "Yuneec-Typhoon": {"width": 0.520, "height": 0.310, "domain": "CIVILIAN"},
+    "Yuneec-H520": {"width": 0.520, "height": 0.310, "domain": "CIVILIAN"},
+    "Autel-EVO": {"width": 0.360, "height": 0.110, "domain": "CIVILIAN"},
+    "Skydio-2": {"width": 0.310, "height": 0.065, "domain": "CIVILIAN"},
+    "Skydio-X2": {"width": 0.660, "height": 0.210, "domain": "CIVILIAN"},
+    "Generic-Quadcopter": {"width": 0.380, "height": 0.140, "domain": "CIVILIAN"},
+    "Generic-Hexacopter": {"width": 0.650, "height": 0.280, "domain": "CIVILIAN"},
+    "FPV-Racing-Drone": {"width": 0.220, "height": 0.075, "domain": "CIVILIAN"},
+    "Quadcopter-UAV": {"width": 0.380, "height": 0.140, "domain": "CIVILIAN"},
+    "Micro-Mini": {"width": 0.245, "height": 0.080, "domain": "CIVILIAN"},
+
+    # Military Tactical / Combat UAVs
+    "Bayraktar-TB2": {"width": 12.00, "height": 2.20, "domain": "MILITARY"},
+    "Shahed-136": {"width": 2.50, "height": 0.50, "domain": "MILITARY"},
+    "Orlan-10": {"width": 3.10, "height": 0.65, "domain": "MILITARY"},
+    "RQ11-Raven": {"width": 1.37, "height": 0.35, "domain": "MILITARY"},
+    "RQ7-Shadow": {"width": 4.57, "height": 1.00, "domain": "MILITARY"},
+    "RQ4-GlobalHawk": {"width": 39.90, "height": 4.70, "domain": "MILITARY"},
+    "Predator-Reaper": {"width": 20.00, "height": 3.80, "domain": "MILITARY"},
+    "MQ9-Reaper": {"width": 20.00, "height": 3.80, "domain": "MILITARY"},
+    "MQ1-Predator": {"width": 14.80, "height": 2.10, "domain": "MILITARY"},
+    "ScanEagle": {"width": 3.11, "height": 0.50, "domain": "MILITARY"},
+    "Switchblade-300": {"width": 0.60, "height": 0.15, "domain": "MILITARY"},
+    "Switchblade-600": {"width": 1.30, "height": 0.30, "domain": "MILITARY"},
+    "IAI-Heron": {"width": 16.60, "height": 3.20, "domain": "MILITARY"},
+    "Hermes-450": {"width": 10.50, "height": 2.30, "domain": "MILITARY"},
+    "Hermes-900": {"width": 15.00, "height": 3.00, "domain": "MILITARY"},
+    "Lancet-3": {"width": 1.65, "height": 0.40, "domain": "MILITARY"},
+    "Tactical-Wing": {"width": 1.37, "height": 0.35, "domain": "MILITARY"},
+}
+
+
 def get_drone_width(drone_type):
     if not drone_type:
         return 0.38
+    if drone_type in DRONE_PHYSICAL_SPECS:
+        return DRONE_PHYSICAL_SPECS[drone_type]["width"]
     if drone_type in DRONE_WIDTHS:
         return DRONE_WIDTHS[drone_type]
-    # Check case-insensitive match
-    for k, v in DRONE_WIDTHS.items():
+    for k, v in DRONE_PHYSICAL_SPECS.items():
         if k.lower() == str(drone_type).lower():
-            return v
+            return v["width"]
     return 0.38
 
 
 def get_drone_domain(drone_type):
     if not drone_type or str(drone_type).upper() == "UNKNOWN":
         return "UNKNOWN"
+    if drone_type in DRONE_PHYSICAL_SPECS:
+        return DRONE_PHYSICAL_SPECS[drone_type]["domain"]
     if drone_type in AIRFRAME_DOMAINS:
         return AIRFRAME_DOMAINS[drone_type]
     for k, v in AIRFRAME_DOMAINS.items():
@@ -334,29 +383,38 @@ def get_drone_domain(drone_type):
 
 def get_drone_dimensions(drone_type, aspect_ratio=2.0):
     """
-    Returns auto-calibrated physical width and height for distance estimation.
-    If the type is generic or unknown, estimates based on morphological aspect ratio and domain.
+    Returns auto-calibrated exact physical width, height, and diagonal for CRLB distance estimation.
+    If the type is unknown, estimates based on morphological aspect ratio and domain.
     """
-    w = get_drone_width(drone_type)
     domain = get_drone_domain(drone_type)
 
-    # Specific known airframes with direct physical measurements
-    if drone_type and str(drone_type).lower() not in ["unknown", "civilian", "military"] and domain != "UNKNOWN":
-        if domain == "MILITARY" or w > 1.0:
-            h = w * 0.25
-        else:
-            h = w * 0.37
-        return {"name": str(drone_type), "width": w, "height": h, "domain": domain, "auto": True}
+    # 1. Exact match from verified specifications database
+    if drone_type and str(drone_type).lower() not in ["unknown", "civilian", "military"]:
+        for model_name, specs in DRONE_PHYSICAL_SPECS.items():
+            if model_name.lower() == str(drone_type).lower():
+                w = specs["width"]
+                h = specs["height"]
+                d = math.sqrt(w**2 + h**2)
+                return {"name": model_name, "width": w, "height": h, "diag": d, "domain": specs["domain"], "auto": True}
 
-    # Morphological airframe resolution when generic civilian/military or unknown
+    # 2. Morphological airframe resolution when generic civilian/military or unknown
     if domain == "MILITARY" or aspect_ratio >= 2.6:
         model_name = "Tactical-Wing" if str(drone_type).lower() in ["military", "unknown"] else str(drone_type)
-        return {"name": model_name, "width": 1.37, "height": 0.35, "domain": "MILITARY", "auto": True}
+        w = 1.37
+        h = 0.35
+        d = math.sqrt(w**2 + h**2)
+        return {"name": model_name, "width": w, "height": h, "diag": d, "domain": "MILITARY", "auto": True}
     elif aspect_ratio >= 1.4:
         model_name = "Quadcopter-UAV" if str(drone_type).lower() in ["civilian", "unknown"] else str(drone_type)
-        return {"name": model_name, "width": 0.38, "height": 0.14, "domain": "CIVILIAN", "auto": True}
+        w = 0.38
+        h = 0.14
+        d = math.sqrt(w**2 + h**2)
+        return {"name": model_name, "width": w, "height": h, "diag": d, "domain": "CIVILIAN", "auto": True}
     else:
         model_name = "Micro-Mini" if str(drone_type).lower() in ["civilian", "unknown"] else str(drone_type)
-        return {"name": model_name, "width": 0.24, "height": 0.08, "domain": "CIVILIAN", "auto": True}
+        w = 0.245
+        h = 0.08
+        d = math.sqrt(w**2 + h**2)
+        return {"name": model_name, "width": w, "height": h, "diag": d, "domain": "CIVILIAN", "auto": True}
 
 
