@@ -174,8 +174,6 @@ if cap is None or not cap.isOpened():
                 temp_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
                 temp_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
                 temp_cap.set(cv2.CAP_PROP_FPS, 30)
-                # Anti-Blur: Configure fast shutter / exposure mode for Logitech & USB 1080p cameras
-                temp_cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 3)
             except Exception:
                 pass
 
