@@ -679,8 +679,10 @@ while True:
             # Update Kinematics
             target_kin.update(frame_count, current_time, x_3d, y_3d, z_est, sigma_d, crlb_var)
 
-            # Instantaneous Confirmation for fast responsive display
-            is_confirmed = (confidence >= 0.16)
+            # Anti-Glitch Confirmation:
+            # - Immediate confirmation for confident detections (>= 0.30)
+            # - 2-hit confirmation for low-confidence detections (>= 0.16) to eliminate momentary laptop motion blur
+            is_confirmed = (confidence >= 0.30) or (target_kin.hits >= 2 and confidence >= 0.16)
             if is_confirmed:
                 confirmed_drone_count += 1
                 disp_z = target_kin.smoothed_z if target_kin.smoothed_z is not None else z_est
