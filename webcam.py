@@ -388,6 +388,102 @@ class KalmanRangeFilter:
         self.p11 = max(1e-3, -k1 * self.p01 + self.p11)
         return self.z, self.vz
 
+class BayesianDroneClassifier:
+    """
+    Physics-Informed Bayesian Multi-Cue Classification Engine (Derivation Multi-Modal).
+    Fuses:
+    1. Visual Evidence: P(Military | Visual Crop) from neural classifier.
+    2. Kinematic Evidence: Speed & Hover State (Fixed-wing cannot hover, multirotor hovers).
+    3. Geometric Evidence: Aspect ratio (w/h) and CRLB estimated physical span.
+    4. Temporal Persistence: Recursive Log-Odds Bayes Filter.
+    """
+    def __init__(self, prior_military_prob=0.30):
+        self.log_odds = math.log(prior_military_prob / (1.0 - prior_military_prob))
+        self.military_prob = prior_military_prob
+
+    def update(self, visual_label, visual_conf, speed_kmh, aspect_ratio, span_m=0.38):
+        # 1. Visual Evidence Likelihood
+        if visual_label and str(visual_label).upper() != "UNKNOWN":
+            domain = get_drone_domain(visual_label)
+            if domain == "MILITARY":
+                p_vis_mil = min(0.95, max(0.55, float(visual_conf)))
+            elif domain == "CIVILIAN":
+                p_vis_mil = max(0.05, min(0.45, 1.0 - float(visual_conf)))
+            else:
+                p_vis_mil = 0.50
+            l_visual = math.log(p_vis_mil / max(1e-4, 1.0 - p_vis_mil))
+        else:
+            l_visual = 0.0
+
+        # 2. Kinematic Velocity & Hover Likelihood
+        # Multirotors (Civilian) hover (0-20 km/h) or fly 0-60 km/h.
+        # Fixed-Wing (Military) cannot hover (stall speed ~70-90 km/h), cruise 100-300 km/h.
+        if speed_kmh is not None and speed_kmh >= 0.0:
+            if speed_kmh < 22.0:
+                l_kin = -1.2  # Strong multirotor / civilian hovering evidence
+            elif speed_kmh > 85.0:
+                l_kin = 1.4   # Strong fixed-wing / tactical military speed
+            elif speed_kmh > 55.0:
+                l_kin = 0.4
+            else:
+                l_kin = -0.3
+        else:
+            l_kin = 0.0
+
+        # 3. Geometric Aspect Ratio Likelihood
+        # Multirotors: 1.2 <= AR <= 2.2. Fixed-wing tactical UAVs: AR >= 2.6 up to 5.0
+        if aspect_ratio >= 2.7:
+            l_geom = 1.5   # High aspect ratio = Fixed-wing Tactical
+        elif aspect_ratio >= 2.3:
+            l_geom = 0.7
+        elif aspect_ratio <= 1.8:
+            l_geom = -1.0  # Multirotor signature
+        else:
+            l_geom = 0.0
+
+        # 4. Physical Span Likelihood (CRLB estimated)
+        if span_m > 1.20:
+            l_span = 0.8
+        elif span_m < 0.50:
+            l_span = -0.6
+        else:
+            l_span = 0.0
+
+        # 5. Recursive Bayesian Fusion (weighted update with temporal smoothing)
+        w_vis = 1.0 if l_visual != 0.0 else 0.0
+        w_kin = 0.7 if speed_kmh is not None and speed_kmh > 0.5 else 0.0
+        w_geom = 1.0
+        w_span = 0.5
+
+        delta_log_odds = (w_vis * l_visual) + (w_kin * l_kin) + (w_geom * l_geom) + (w_span * l_span)
+        self.log_odds = 0.85 * self.log_odds + delta_log_odds
+
+        # Bound log odds to prevent saturation [-5.0, 5.0]
+        self.log_odds = max(-5.0, min(5.0, self.log_odds))
+        self.military_prob = 1.0 / (1.0 + math.exp(-self.log_odds))
+
+        # Decision
+        if self.military_prob >= 0.52:
+            domain = "MILITARY"
+            conf = self.military_prob
+            if visual_label and str(visual_label).lower() not in ["civilian", "military", "unknown"]:
+                type_name = str(visual_label)
+            else:
+                type_name = "Tactical-Wing"
+        else:
+            domain = "CIVILIAN"
+            conf = 1.0 - self.military_prob
+            if visual_label and str(visual_label).lower() not in ["civilian", "military", "unknown"]:
+                type_name = str(visual_label)
+            else:
+                if aspect_ratio >= 1.4:
+                    type_name = "Quadcopter-UAV"
+                else:
+                    type_name = "Micro-Mini"
+
+        return domain, type_name, conf
+
+
 class TargetKinematics:
     def __init__(self, track_id):
         self.track_id = track_id
@@ -401,46 +497,26 @@ class TargetKinematics:
         self.speed_kmh = 0.0
         self.approach_rate = 0.0  # m/s (+ approaching, - receding)
         self.eta_seconds = None
-        self.type_votes = {}
+        self.bayes_classifier = BayesianDroneClassifier()
         self.cached_type = "UNKNOWN"
         self.cached_domain = "UNKNOWN"
         self.cached_type_score = 0.0
         self.auto_profile = None
         self.last_classified_frame = -10
 
-    def update_type(self, label, confidence, aspect_ratio=2.0):
-        """Smooth classifications over a track and dynamically auto-calibrate dimensions."""
-        if label and label != "UNKNOWN":
-            self.type_votes[label] = self.type_votes.get(label, 0.0) * 0.85 + float(confidence)
-            best_label, score = max(self.type_votes.items(), key=lambda item: item[1])
-            self.cached_domain = get_drone_domain(best_label)
-
-            # If classifier returned a specific airframe (e.g. DJI-Phantom, RQ7-Shadow)
-            if best_label.lower() not in ["civilian", "military", "unknown"]:
-                self.cached_type = best_label
-            else:
-                # If generic domain was returned, resolve airframe model by aspect ratio
-                if self.cached_domain == "MILITARY" or aspect_ratio >= 2.6:
-                    self.cached_type = "Tactical-Wing"
-                elif aspect_ratio >= 1.4:
-                    self.cached_type = "Quadcopter-UAV"
-                else:
-                    self.cached_type = "Micro-Mini"
-
-            self.cached_type_score = min(0.99, max(confidence, score / (score + 0.35)))
-        elif self.cached_type == "UNKNOWN":
-            # Intelligent physical domain fallback based on airframe aspect ratio
-            if aspect_ratio >= 2.6:
-                self.cached_type = "Tactical-Wing"
-                self.cached_domain = "MILITARY"
-            elif aspect_ratio >= 1.4:
-                self.cached_type = "Quadcopter-UAV"
-                self.cached_domain = "CIVILIAN"
-            else:
-                self.cached_type = "Micro-Mini"
-                self.cached_domain = "CIVILIAN"
-            self.cached_type_score = 0.80
-
+    def update_type(self, visual_label, visual_conf, aspect_ratio=2.0):
+        """Physics-Informed Bayesian Multi-Cue Fusion: Visual + Kinematics + Geometry."""
+        current_span = self.auto_profile["width"] if self.auto_profile else 0.38
+        domain, type_name, conf = self.bayes_classifier.update(
+            visual_label=visual_label,
+            visual_conf=visual_conf,
+            speed_kmh=self.speed_kmh,
+            aspect_ratio=aspect_ratio,
+            span_m=current_span
+        )
+        self.cached_domain = domain
+        self.cached_type = type_name
+        self.cached_type_score = min(0.99, max(0.50, conf))
         self.auto_profile = get_drone_dimensions(self.cached_type, aspect_ratio=aspect_ratio)
         return self.cached_type, self.cached_type_score, self.auto_profile
 
