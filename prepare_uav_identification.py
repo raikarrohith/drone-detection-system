@@ -13,14 +13,47 @@ from pathlib import Path
 
 
 AIRFRAME_LABELS = {
+    # Civilian / Commercial / Hobbyist Models
     "DJI-Mavic": "civilian",
+    "DJI-Mavic-Air": "civilian",
+    "DJI-Mini": "civilian",
     "DJI-Phantom": "civilian",
+    "DJI-Inspire": "civilian",
+    "DJI-Matrice": "civilian",
+    "DJI-FPV": "civilian",
+    "DJI-Avata": "civilian",
     "Parrot_Bebop": "civilian",
+    "Parrot-Anafi": "civilian",
     "Yuneec-Typhoon": "civilian",
+    "Yuneec-H520": "civilian",
+    "Autel-EVO": "civilian",
+    "Skydio-2": "civilian",
+    "Skydio-X2": "civilian",
+    "Holy-Stone": "civilian",
+    "Generic-Quadcopter": "civilian",
+    "Generic-Hexacopter": "civilian",
+    "FPV-Racing-Drone": "civilian",
+    
+    # Military / Tactical / Combat UAVs
     "RQ7-Shadow": "military",
     "RQ4-GlobalHawk": "military",
     "RQ11-Raven": "military",
     "Predator-Reaper": "military",
+    "MQ9-Reaper": "military",
+    "MQ1-Predator": "military",
+    "Bayraktar-TB2": "military",
+    "Shahed-136": "military",
+    "Orlan-10": "military",
+    "ScanEagle": "military",
+    "Switchblade-300": "military",
+    "Switchblade-600": "military",
+    "IAI-Heron": "military",
+    "Hermes-450": "military",
+    "Hermes-900": "military",
+    "Lancet-3": "military",
+    "Wing-Loong": "military",
+    "CH4-Rainbow": "military",
+    "Puma-AE": "military",
 }
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 

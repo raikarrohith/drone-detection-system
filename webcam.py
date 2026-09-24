@@ -27,7 +27,7 @@ parser = argparse.ArgumentParser(description="Drone Defense & CRLB Distance Esti
 parser.add_argument("--video", "-v", type=str, default=None, help="Path to test video file (e.g. drone_test.mp4)")
 parser.add_argument("--camera", "-c", type=int, default=None, help="Camera index (e.g. 0, 1, 2)")
 parser.add_argument("--imgsz", type=int, default=960, help="Inference resolution: 960 (balanced long-range) or 1280/640")
-parser.add_argument("--type-model", type=str, default="drone_classifier/model/drone_cnn_best.pth", help="Optional civilian/military Ultralytics classification model")
+parser.add_argument("--type-model", type=str, default="models/drone_type_classifier.pt", help="Optional civilian/military classification model (.pt or .pth)")
 parser.add_argument("--type-confidence", type=float, default=0.45, help="Minimum drone-type classifier confidence (0-1)")
 parser.add_argument("--drone-width", type=float, default=None, help="Measured rotor-tip-to-tip span in metres; overrides the selected profile width")
 parser.add_argument("--focal-length-px", type=float, default=None, help="Calibrated focal length in pixels for the active camera resolution")
@@ -413,18 +413,31 @@ class TargetKinematics:
         if label and label != "UNKNOWN":
             self.type_votes[label] = self.type_votes.get(label, 0.0) * 0.85 + float(confidence)
             best_label, score = max(self.type_votes.items(), key=lambda item: item[1])
-            self.cached_type = best_label
             self.cached_domain = get_drone_domain(best_label)
-            if self.cached_domain == "UNKNOWN":
-                self.cached_domain = "CIVILIAN"
+
+            # If classifier returned a specific airframe (e.g. DJI-Phantom, RQ7-Shadow)
+            if best_label.lower() not in ["civilian", "military", "unknown"]:
+                self.cached_type = best_label
+            else:
+                # If generic domain was returned, resolve airframe model by aspect ratio
+                if self.cached_domain == "MILITARY" or aspect_ratio >= 2.6:
+                    self.cached_type = "Tactical-Wing"
+                elif aspect_ratio >= 1.4:
+                    self.cached_type = "Quadcopter-UAV"
+                else:
+                    self.cached_type = "Micro-Mini"
+
             self.cached_type_score = min(0.99, max(confidence, score / (score + 0.35)))
         elif self.cached_type == "UNKNOWN":
             # Intelligent physical domain fallback based on airframe aspect ratio
-            if aspect_ratio >= 2.8:
+            if aspect_ratio >= 2.6:
                 self.cached_type = "Tactical-Wing"
                 self.cached_domain = "MILITARY"
+            elif aspect_ratio >= 1.4:
+                self.cached_type = "Quadcopter-UAV"
+                self.cached_domain = "CIVILIAN"
             else:
-                self.cached_type = "Quad-UAV"
+                self.cached_type = "Micro-Mini"
                 self.cached_domain = "CIVILIAN"
             self.cached_type_score = 0.80
 
@@ -591,6 +604,7 @@ while True:
 
     confirmed_drone_count = 0
     telemetry_records = []
+    classified_in_this_frame = 0
 
     for result in results:
         boxes = result.boxes
@@ -601,7 +615,7 @@ while True:
             cls_id = int(box.cls[0])
             confidence = float(box.conf[0])
 
-            if cls_id != DRONE_CLASS_ID or confidence < max(0.05, conf_threshold * 0.70):
+            if cls_id != DRONE_CLASS_ID or confidence < max(0.05, conf_threshold * 0.65):
                 continue
 
             track_id = int(box.id[0]) if box.id is not None else None
@@ -612,9 +626,9 @@ while True:
             char_dim = max(box_w, box_h)
 
             # 1. Clutter Rejection Filter (extreme slivers)
-            if aspect_ratio > 4.2 and confidence < 0.60:
+            if aspect_ratio > 4.5 and confidence < 0.50:
                 continue
-            if (box_w * box_h) > (0.60 * w * h):
+            if (box_w * box_h) > (0.65 * w * h):
                 continue
 
             # 2. Optical Hollow-Lens & Tall Human Rejection Filter:
@@ -636,14 +650,13 @@ while True:
             u_center = (x1 + x2) / 2.0
             v_center = (y1 + y2) / 2.0
 
-            # 3. Dynamic Airframe Classification & Auto-Profile Resolution (NO MANUAL KEYS REQUIRED)
-            if type_classifier.enabled and (target_kin.cached_type == "UNKNOWN" or (frame_count - target_kin.last_classified_frame >= 6)):
-                if crop.size > 0:
-                    frame_type, frame_type_conf = type_classifier.classify(crop, device=DEVICE)
-                    target_kin.last_classified_frame = frame_count
-                    drone_type, drone_type_score, auto_prof = target_kin.update_type(frame_type, frame_type_conf, aspect_ratio=aspect_ratio)
-                else:
-                    drone_type, drone_type_score, auto_prof = target_kin.cached_type, target_kin.cached_type_score, target_kin.auto_profile
+            # 3. Dynamic Airframe Classification & Auto-Profile Resolution (Zero-Lag Throttled: max 1 per frame)
+            needs_classification = type_classifier.enabled and (target_kin.cached_type == "UNKNOWN" or (frame_count - target_kin.last_classified_frame >= 45))
+            if needs_classification and classified_in_this_frame < 1 and crop.size > 0:
+                frame_type, frame_type_conf = type_classifier.classify(crop, device=DEVICE)
+                classified_in_this_frame += 1
+                target_kin.last_classified_frame = frame_count
+                drone_type, drone_type_score, auto_prof = target_kin.update_type(frame_type, frame_type_conf, aspect_ratio=aspect_ratio)
             else:
                 drone_type, drone_type_score, auto_prof = target_kin.cached_type, target_kin.cached_type_score, target_kin.auto_profile
 
@@ -663,10 +676,11 @@ while True:
             x_3d = ((u_center - cx_cam) * z_est) / FOCAL_LENGTH_PX
             y_3d = ((v_center - cy_cam) * z_est) / FOCAL_LENGTH_PX
 
-            # Multi-frame Track Confirmation:
-            # - High confidence (>= 0.40): immediate confirmation
-            # - Moderate/Low confidence (< 0.40): require >= 2 consecutive frames to eliminate momentary 1-frame motion glitches
-            is_confirmed = (confidence >= 0.40) or (target_kin.hits >= 2 and confidence >= 0.16)
+            # Update Kinematics
+            target_kin.update(frame_count, current_time, x_3d, y_3d, z_est, sigma_d, crlb_var)
+
+            # Instantaneous Confirmation for fast responsive display
+            is_confirmed = (confidence >= 0.16)
             if is_confirmed:
                 confirmed_drone_count += 1
                 disp_z = target_kin.smoothed_z if target_kin.smoothed_z is not None else z_est
@@ -688,79 +702,69 @@ while True:
                     "bbox": [x1, y1, x2, y2]
                 })
 
-                # Threat Zone Color Coding by Domain & Distance
                 # Threat Zone & Domain Classification Styling
                 domain = target_kin.cached_domain
                 if domain == "MILITARY":
                     box_color = (0, 0, 255)       # Red: Military Drone
-                    domain_label = "MILITARY UAV [HIGH THREAT]"
-                    domain_text_color = (0, 50, 255)
+                    domain_label = "MILITARY"
+                    domain_text_color = (0, 70, 255)
                 elif domain == "CIVILIAN":
                     box_color = (0, 255, 120)     # Green/Cyan: Civilian Drone
-                    domain_label = "CIVILIAN DRONE [SURVEILLANCE]"
+                    domain_label = "CIVILIAN"
                     domain_text_color = (0, 255, 120)
                 else:
                     box_color = (0, 215, 255)     # Amber/Yellow: Unknown Drone
-                    domain_label = "UNKNOWN AIRFRAME [UNVERIFIED]"
+                    domain_label = "UNKNOWN"
                     domain_text_color = (0, 215, 255)
 
                 # Draw Target Box & Corner Reticles
                 cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
-                corner_len = max(8, min(24, box_w // 3, box_h // 3))
-                cv2.line(frame, (x1, y1), (x1 + corner_len, y1), (0, 255, 255), 3)
-                cv2.line(frame, (x1, y1), (x1, y1 + corner_len), (0, 255, 255), 3)
-                cv2.line(frame, (x2, y1), (x2 - corner_len, y1), (0, 255, 255), 3)
-                cv2.line(frame, (x2, y1), (x2, y1 + corner_len), (0, 255, 255), 3)
-                cv2.line(frame, (x1, y2), (x1 + corner_len, y2), (0, 255, 255), 3)
-                cv2.line(frame, (x1, y2), (x1, y2 - corner_len), (0, 255, 255), 3)
-                cv2.line(frame, (x2, y2), (x2 - corner_len, y2), (0, 255, 255), 3)
-                cv2.line(frame, (x2, y2), (x2, y2 - corner_len), (0, 255, 255), 3)
+                corner_len = max(6, min(18, box_w // 3, box_h // 3))
+                cv2.line(frame, (x1, y1), (x1 + corner_len, y1), (0, 255, 255), 2)
+                cv2.line(frame, (x1, y1), (x1, y1 + corner_len), (0, 255, 255), 2)
+                cv2.line(frame, (x2, y1), (x2 - corner_len, y1), (0, 255, 255), 2)
+                cv2.line(frame, (x2, y1), (x2, y1 + corner_len), (0, 255, 255), 2)
+                cv2.line(frame, (x1, y2), (x1 + corner_len, y2), (0, 255, 255), 2)
+                cv2.line(frame, (x1, y2), (x1, y2 - corner_len), (0, 255, 255), 2)
+                cv2.line(frame, (x2, y2), (x2 - corner_len, y2), (0, 255, 255), 2)
+                cv2.line(frame, (x2, y2), (x2 - corner_len, y2), (0, 255, 255), 2)
 
                 # Center Reticle Target Point
-                cv2.circle(frame, (int(u_center), int(v_center)), 4, (0, 255, 255), -1)
+                cv2.circle(frame, (int(u_center), int(v_center)), 3, (0, 255, 255), -1)
 
-                # --- 4-LINE TACTICAL CLASSIFICATION & RANGE BADGE ---
-                line1 = f"[{domain_label}] #ID:{track_id} ({confidence*100:.0f}%)"
-                
-                # Adaptive error formatting (cm for close range, m for long range)
+                # --- COMPACT, NON-OVERLAPPING TACTICAL HUD BADGE ---
                 if sigma_d < 0.20:
-                    err_str = f"+/-{sigma_d*100:.1f}cm"
-                    ci_str = f"{ci_low:.2f}-{ci_high:.2f}m"
+                    err_str = f"+/-{sigma_d*100:.0f}cm"
                 else:
-                    err_str = f"+/-{sigma_d:.2f}m"
-                    ci_str = f"{ci_low:.1f}-{ci_high:.1f}m"
-                    
-                type_conf_str = f" ({drone_type_score:.0%})" if drone_type != "UNKNOWN" else ""
-                line2 = f"MODEL: {drone_type}{type_conf_str} | SPAN: {distance_profile['width']*100:.0f}cm (CALIB)"
-                line3 = f"RANGE: {disp_z:.2f}m  [CRLB: {err_str} | 95% CI: {ci_str}]"
-                
-                # Approach vector text
-                if target_kin.approach_rate > 0.8:
-                    eta_str = f"ETA: {target_kin.eta_seconds:.1f}s" if target_kin.eta_seconds else ""
-                    line4 = f"VEL: {target_kin.speed_kmh:.1f}km/h (CLOSING @ +{target_kin.approach_rate:.1f}m/s {eta_str})"
-                    line4_color = (0, 255, 255)
-                elif target_kin.approach_rate < -0.8:
-                    line4 = f"VEL: {target_kin.speed_kmh:.1f}km/h (RECEDING @ {target_kin.approach_rate:.1f}m/s)"
-                    line4_color = (180, 255, 180)
-                else:
-                    line4 = f"VEL: {target_kin.speed_kmh:.1f}km/h (HOVER / LATERAL)"
-                    line4_color = (220, 220, 220)
+                    err_str = f"+/-{sigma_d:.1f}m"
 
-                badge_w = max(470, int(box_w + 110))
-                badge_h = 76
-                badge_y1 = max(0, y1 - badge_h - 6)
-                badge_y2 = y1 - 6
+                type_conf_str = f" {drone_type_score:.0%}" if drone_type != "UNKNOWN" else ""
+                
+                line1 = f"[{domain_label}] #{track_id} ({confidence*100:.0f}%) | {disp_z:.2f}m ({err_str})"
+                line2 = f"TYPE: {drone_type}{type_conf_str} | SPAN: {distance_profile['width']*100:.0f}cm"
+
+                badge_w = max(240, min(330, int(box_w + 35)))
+                badge_h = 38
+                
+                # Smart badge vertical positioning: if not enough room above or near top header, put below
+                if y1 - badge_h - 4 < 44:
+                    badge_y1 = min(h - badge_h - 2, y2 + 4)
+                    badge_y2 = badge_y1 + badge_h
+                else:
+                    badge_y1 = max(44, y1 - badge_h - 4)
+                    badge_y2 = badge_y1 + badge_h
+
+                badge_x1 = max(2, min(w - badge_w - 2, x1))
+                badge_x2 = badge_x1 + badge_w
 
                 # Semi-transparent HUD overlay
                 overlay = frame.copy()
-                cv2.rectangle(overlay, (x1, badge_y1), (x1 + badge_w, badge_y2), (18, 18, 18), -1)
-                cv2.addWeighted(overlay, 0.80, frame, 0.20, 0, frame)
-                cv2.rectangle(frame, (x1, badge_y1), (x1 + badge_w, badge_y2), box_color, 1)
+                cv2.rectangle(overlay, (badge_x1, badge_y1), (badge_x2, badge_y2), (18, 18, 18), -1)
+                cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)
+                cv2.rectangle(frame, (badge_x1, badge_y1), (badge_x2, badge_y2), box_color, 1)
 
-                cv2.putText(frame, line1, (x1 + 6, badge_y1 + 17), cv2.FONT_HERSHEY_SIMPLEX, 0.46, domain_text_color, 1, cv2.LINE_AA)
-                cv2.putText(frame, line2, (x1 + 6, badge_y1 + 34), cv2.FONT_HERSHEY_SIMPLEX, 0.41, (240, 240, 240), 1, cv2.LINE_AA)
-                cv2.putText(frame, line3, (x1 + 6, badge_y1 + 51), cv2.FONT_HERSHEY_SIMPLEX, 0.41, (0, 255, 0), 1, cv2.LINE_AA)
-                cv2.putText(frame, line4, (x1 + 6, badge_y1 + 68), cv2.FONT_HERSHEY_SIMPLEX, 0.38, line4_color, 1, cv2.LINE_AA)
+                cv2.putText(frame, line1, (badge_x1 + 6, badge_y1 + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.42, domain_text_color, 1, cv2.LINE_AA)
+                cv2.putText(frame, line2, (badge_x1 + 6, badge_y1 + 31), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (230, 230, 230), 1, cv2.LINE_AA)
 
     # Periodic Telemetry CSV Append
     if telemetry_records and frame_count % 3 == 0:

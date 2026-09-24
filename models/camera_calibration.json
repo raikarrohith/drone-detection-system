@@ -1,0 +1,11 @@
+{
+    "cameras": {
+        "camera_0": {
+            "focal_length_px": 1231.58,
+            "resolution": "1280x720",
+            "calibrated_at": "2026-09-24 11:02:28",
+            "calibration_distance_m": 1.0,
+            "target_width_m": 0.38
+        }
+    }
+}
