@@ -1,7 +1,6 @@
-path: /Users/rohithraikar/drone_demo/dataset_raw/drone_dataset
-
-train: train/images
-val: valid/images
+path: D:/drone/drone-detection-system/dataset_raw/drone_dataset
+train: images/train
+val: images/val
 
 nc: 1
 names:
