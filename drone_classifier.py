@@ -5,11 +5,18 @@ import json
 
 import torch
 import torch.nn as nn
-from torchvision import transforms
+from torchvision import transforms, models
 from PIL import Image
 
 
 UNKNOWN = "UNKNOWN"
+
+
+def build_mobilenet(num_classes):
+    model = models.mobilenet_v3_small(weights=None)
+    in_features = model.classifier[3].in_features
+    model.classifier[3] = nn.Linear(in_features, num_classes)
+    return model
 
 
 class DroneCNN(nn.Module):
@@ -97,9 +104,14 @@ class DroneTypeClassifier:
             )
 
             self.classes = checkpoint["classes"]
+            state_dict = checkpoint["model_state"]
 
-            self.model = DroneCNN(len(self.classes))
-            self.model.load_state_dict(checkpoint["model_state"])
+            if checkpoint.get("arch") == "mobilenet_v3_small" or "features.0.0.weight" in state_dict:
+                self.model = build_mobilenet(len(self.classes))
+            else:
+                self.model = DroneCNN(len(self.classes))
+
+            self.model.load_state_dict(state_dict)
             self.model.eval()
 
             image_size = checkpoint.get("image_size", 224)
@@ -116,8 +128,8 @@ class DroneTypeClassifier:
             self.enabled = True
 
             print(
-                f"[*] 8-Class Drone Classifier loaded "
-                f"({len(self.classes)} classes)"
+                f"[*] Drone Model Classifier loaded "
+                f"({len(self.classes)} classes: {', '.join(self.classes)})"
             )
 
         except Exception as exc:
