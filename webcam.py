@@ -249,47 +249,21 @@ target_nominal_width = target_nominal_profile["width"]
 
 def compute_crlb_distance(pixel_w, pixel_h, target_profile, focal_length, sigma_w, u_center=None, v_center=None, cx_cam=None, cy_cam=None):
     """
-    Computes Deterministic Monocular Distance with Multi-Cue Inverse-Variance Fusion (Derivation 3A)
-    and theoretical Cramer-Rao Lower Bound (CRLB) / Fisher Information bounds (Derivation 2).
+    Computes Deterministic Monocular Distance using Pure Wingspan/Width Estimation
+    with Off-Axis Cosine Perspective Correction and Analytical Fisher Information / CRLB Error Bounds.
     
     Estimators:
-    1. Width-based:    D_w    = (W * F) / pixel_w
-    2. Height-based:   D_h    = (H * F) / pixel_h
-    3. Diagonal-based: D_diag = (L_diag * F) / pixel_diag
-    
-    Fisher Information weights: w_i = I(D_i) / sum(I(D_j))
-    Fused Distance: D* = sum(w_i * D_i)
-    
-    Off-Axis Angle Correction:
-    Accounts for perspective ray elongation when the target is off optical axis center.
+    1. Width-based Slant Distance: D_slant = (W_physical * F) / pixel_w
+    2. Off-Axis Angle Correction:   D_z     = D_slant * cos(theta)
+    3. Analytical Fisher Bounds:   I(D)    = (W^2 * F^2) / (sigma_w^2 * D^4)
     """
     target_w = target_profile["width"]
-    target_h = target_profile.get("height", target_w * 0.35)
-    target_diag = math.sqrt(target_w**2 + target_h**2)
-    
     pw = max(2.0, float(pixel_w))
-    ph = max(2.0, float(pixel_h))
-    pdiag = math.sqrt(pw**2 + ph**2)
     
-    # 1. Independent Multi-Cue Distance Estimators
-    d_w = (target_w * focal_length) / pw
-    d_diag = (target_diag * focal_length) / pdiag
-    d_h = (target_h * focal_length) / ph
+    # 1. Pure Wingspan/Width Distance Estimator
+    slant_distance = (target_w * focal_length) / pw
     
-    # 2. Fisher Information for each geometric cue
-    fisher_w = (target_w**2 * focal_length**2) / ((sigma_w**2) * (d_w**4))
-    fisher_diag = (target_diag**2 * focal_length**2) / ((sigma_w**2) * (d_diag**4))
-    fisher_h = (target_h**2 * focal_length**2) / ((sigma_w**2) * (d_h**4)) * 0.40  # Lower weight on height due to pitch tilt
-    
-    # 3. Optimal BLUE Inverse-Variance Fusion (Derivation 3A)
-    fisher_total = max(1e-9, fisher_w + fisher_diag + fisher_h)
-    w_w = fisher_w / fisher_total
-    w_diag = fisher_diag / fisher_total
-    w_h = fisher_h / fisher_total
-    
-    slant_distance = (w_w * d_w) + (w_diag * d_diag) + (w_h * d_h)
-    
-    # 4. Off-Axis Perspective Cosine Ray-Angle Correction
+    # 2. Off-Axis Perspective Cosine Ray-Angle Correction
     if u_center is not None and v_center is not None and cx_cam is not None and cy_cam is not None:
         r_off = math.sqrt((u_center - cx_cam)**2 + (v_center - cy_cam)**2)
         cos_theta = focal_length / math.sqrt(focal_length**2 + r_off**2)
@@ -297,9 +271,11 @@ def compute_crlb_distance(pixel_w, pixel_h, target_profile, focal_length, sigma_
     else:
         distance_z = slant_distance
     
-    # 5. Combined variance. Pixel CRLB is only a lower bound; camera focal
-    # calibration and physical-span uncertainty must also be represented.
-    crlb_var_pixel = 1.0 / fisher_total
+    # 3. Fisher Information for Width: I(D) = (W^2 * F^2) / (sigma_w^2 * D^4)
+    fisher_w = (target_w**2 * focal_length**2) / ((sigma_w**2) * (max(0.1, slant_distance)**4))
+    
+    # 4. CRLB Variance & Uncertainty Propagation
+    crlb_var_pixel = 1.0 / max(1e-9, fisher_w)
     crlb_var_pose = (POSE_ASPECT_RATIO_UNCERTAINTY * distance_z) ** 2
     crlb_var_calibration = (CALIBRATION_RELATIVE_UNCERTAINTY * distance_z) ** 2
     total_crlb_variance = crlb_var_pixel + crlb_var_pose + crlb_var_calibration
