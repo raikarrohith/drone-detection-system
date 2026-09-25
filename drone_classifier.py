@@ -59,21 +59,36 @@ class DroneCNN(nn.Module):
 
 class DroneTypeClassifier:
 
-    def __init__(self, model_path=None, confidence_threshold=0.45):
+    def __init__(self, model_path=None, confidence_threshold=0.25):
 
         self.confidence_threshold = confidence_threshold
         self.model = None
+        self.yolo_model = None
         self.enabled = False
         self.classes = []
 
-        if model_path is None:
-            model_path = "drone_classifier/model/drone_cnn_best.pth"
+        # Auto-detect candidates
+        candidates = []
+        if model_path:
+            candidates.append(Path(model_path))
+        candidates.extend([
+            Path("drone_classifier/model/drone_cnn_best.pth"),
+            Path("models/drone_type_classifier.pt"),
+            Path("models/best_classifier.pt"),
+        ])
 
-        model_path = Path(model_path)
+        resolved_path = None
+        for cand in candidates:
+            if cand.is_file():
+                resolved_path = cand
+                break
 
-        if not model_path.is_file():
-            print(f"[!] CNN classifier not found: {model_path}")
+        if resolved_path is None:
+            print(f"[!] Classifier checkpoint not found (searched: {[str(c) for c in candidates]})")
             return
+
+        model_path = resolved_path
+
 
         try:
             checkpoint = torch.load(
@@ -148,6 +163,9 @@ class DroneTypeClassifier:
 # Approximate physical widths in metres.
 # Used by the auto-profile distance estimator.
 DRONE_WIDTHS = {
+    "DJI-Neo": 0.16,
+    "DJI-Mini": 0.24,
+    "DJI-Avata": 0.18,
     "DJI-Mavic": 0.35,
     "DJI-Phantom": 0.35,
     "Parrot_Bebop": 0.38,
@@ -159,21 +177,48 @@ DRONE_WIDTHS = {
 }
 
 AIRFRAME_DOMAINS = {
+    # Civilian
+    "DJI-Neo": "CIVILIAN",
+    "DJI-Mini": "CIVILIAN",
+    "DJI-Avata": "CIVILIAN",
     "DJI-Mavic": "CIVILIAN",
     "DJI-Phantom": "CIVILIAN",
     "Parrot_Bebop": "CIVILIAN",
     "Yuneec-Typhoon": "CIVILIAN",
+    "civilian": "CIVILIAN",
+    "Civilian": "CIVILIAN",
+    
+    # Military
     "RQ11-Raven": "MILITARY",
     "RQ7-Shadow": "MILITARY",
     "Predator-Reaper": "MILITARY",
+    "MQ9-Reaper": "MILITARY",
     "RQ4-GlobalHawk": "MILITARY",
+    "Bayraktar-TB2": "MILITARY",
+    "Shahed-136": "MILITARY",
+    "military": "MILITARY",
+    "Military": "MILITARY",
 }
 
 def get_drone_width(drone_type):
     return DRONE_WIDTHS.get(drone_type)
 
 def get_drone_domain(drone_type):
-    return AIRFRAME_DOMAINS.get(drone_type, "UNKNOWN")
+    if not drone_type or str(drone_type).upper() == "UNKNOWN":
+        return "UNKNOWN"
+    norm = str(drone_type).strip().lower().replace("_", "-")
+    if "civilian" in norm:
+        return "CIVILIAN"
+    if "military" in norm:
+        return "MILITARY"
+    for k, v in AIRFRAME_DOMAINS.items():
+        if k.lower().replace("_", "-") == norm:
+            return v
+    if any(civ in norm for civ in ["dji", "neo", "mavic", "phantom", "mini", "avata", "parrot", "bebop", "yuneec", "typhoon", "autel", "skydio"]):
+        return "CIVILIAN"
+    if any(mil in norm for mil in ["raven", "shadow", "reaper", "predator", "globalhawk", "bayraktar", "shahed", "orlan", "switchblade", "wing"]):
+        return "MILITARY"
+    return "UNKNOWN"
 
 def get_drone_dimensions(drone_type, aspect_ratio=2.0):
     """
@@ -196,5 +241,5 @@ def get_drone_dimensions(drone_type, aspect_ratio=2.0):
     elif aspect_ratio >= 1.6:
         return {"name": "Standard Quad (Auto)", "width": 0.38, "height": 0.14, "domain": "UNKNOWN", "auto": True}
     else:
-        return {"name": "Micro Mini (Auto)", "width": 0.24, "height": 0.08, "domain": "UNKNOWN", "auto": True}
+        return {"name": "Micro/Palm (Auto)", "width": 0.16, "height": 0.05, "domain": "UNKNOWN", "auto": True}
 
