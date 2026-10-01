@@ -1,11 +1,18 @@
 {
     "cameras": {
         "camera_1": {
-            "focal_length_px": 1176.47,
-            "resolution": "1280x720",
-            "calibrated_at": "2026-09-24 15:33:25",
+            "focal_length_px": 987.5,
+            "resolution": "1920x1080",
+            "calibrated_at": "2026-09-29 14:45:33",
             "calibration_distance_m": 1.0,
-            "target_width_m": 0.17
+            "target_width_m": 0.16
+        },
+        "camera_0": {
+            "focal_length_px": 1350.0,
+            "resolution": "1920x1080",
+            "calibrated_at": "2026-09-29 14:05:00",
+            "calibration_distance_m": 1.0,
+            "target_width_m": 0.16
         }
     }
 }
