@@ -1,11 +1,7 @@
-# Dataset configuration for training the optional drone-type classifier.
-# Expected folders:
-# dataset_raw/drone_type_classifier/train/{civilian,military,unknown}/image.jpg
-# dataset_raw/drone_type_classifier/val/{civilian,military,unknown}/image.jpg
 path: /Users/rohithraikar/drone_demo/dataset_raw/drone_type_classifier
 train: train
 val: val
+
 names:
   0: civilian
   1: military
-  2: unknown

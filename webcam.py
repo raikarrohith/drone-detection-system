@@ -413,11 +413,11 @@ def is_human_or_face_false_positive(crop_bgr, aspect_ratio, confidence):
     hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
     ycrcb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2YCrCb)
     
-    mask_hsv1 = cv2.inRange(hsv, np.array([0, 25, 45]), np.array([25, 255, 255]))
-    mask_hsv2 = cv2.inRange(hsv, np.array([170, 25, 45]), np.array([180, 255, 255]))
+    mask_hsv1 = cv2.inRange(hsv, np.array([0, 20, 40]), np.array([28, 255, 255]))
+    mask_hsv2 = cv2.inRange(hsv, np.array([168, 20, 40]), np.array([180, 255, 255]))
     mask_hsv = cv2.bitwise_or(mask_hsv1, mask_hsv2)
     
-    mask_ycrcb = cv2.inRange(ycrcb, np.array([0, 130, 75]), np.array([255, 180, 135]))
+    mask_ycrcb = cv2.inRange(ycrcb, np.array([0, 128, 70]), np.array([255, 182, 138]))
     skin_mask = cv2.bitwise_and(mask_hsv, mask_ycrcb)
     skin_ratio = np.count_nonzero(skin_mask) / max(1, skin_mask.size)
     
@@ -479,6 +479,102 @@ class KalmanRangeFilter:
         self.p11 = max(1e-3, -k1 * self.p01 + self.p11)
         return self.z, self.vz
 
+class BayesianDroneClassifier:
+    """
+    Physics-Informed Bayesian Multi-Cue Classification Engine (Derivation Multi-Modal).
+    Fuses:
+    1. Visual Evidence: P(Military | Visual Crop) from neural classifier.
+    2. Kinematic Evidence: Speed & Hover State (Fixed-wing cannot hover, multirotor hovers).
+    3. Geometric Evidence: Aspect ratio (w/h) and CRLB estimated physical span.
+    4. Temporal Persistence: Recursive Log-Odds Bayes Filter.
+    """
+    def __init__(self, prior_military_prob=0.30):
+        self.log_odds = math.log(prior_military_prob / (1.0 - prior_military_prob))
+        self.military_prob = prior_military_prob
+
+    def update(self, visual_label, visual_conf, speed_kmh, aspect_ratio, span_m=0.38):
+        # 1. Visual Evidence Likelihood
+        if visual_label and str(visual_label).upper() != "UNKNOWN":
+            domain = get_drone_domain(visual_label)
+            if domain == "MILITARY":
+                p_vis_mil = min(0.95, max(0.55, float(visual_conf)))
+            elif domain == "CIVILIAN":
+                p_vis_mil = max(0.05, min(0.45, 1.0 - float(visual_conf)))
+            else:
+                p_vis_mil = 0.50
+            l_visual = math.log(p_vis_mil / max(1e-4, 1.0 - p_vis_mil))
+        else:
+            l_visual = 0.0
+
+        # 2. Kinematic Velocity & Hover Likelihood
+        # Multirotors (Civilian) hover (0-20 km/h) or fly 0-60 km/h.
+        # Fixed-Wing (Military) cannot hover (stall speed ~70-90 km/h), cruise 100-300 km/h.
+        if speed_kmh is not None and speed_kmh >= 0.0:
+            if speed_kmh < 22.0:
+                l_kin = -1.2  # Strong multirotor / civilian hovering evidence
+            elif speed_kmh > 85.0:
+                l_kin = 1.4   # Strong fixed-wing / tactical military speed
+            elif speed_kmh > 55.0:
+                l_kin = 0.4
+            else:
+                l_kin = -0.3
+        else:
+            l_kin = 0.0
+
+        # 3. Geometric Aspect Ratio Likelihood
+        # Multirotors: 1.2 <= AR <= 2.2. Fixed-wing tactical UAVs: AR >= 2.6 up to 5.0
+        if aspect_ratio >= 2.7:
+            l_geom = 1.5   # High aspect ratio = Fixed-wing Tactical
+        elif aspect_ratio >= 2.3:
+            l_geom = 0.7
+        elif aspect_ratio <= 1.8:
+            l_geom = -1.0  # Multirotor signature
+        else:
+            l_geom = 0.0
+
+        # 4. Physical Span Likelihood (CRLB estimated)
+        if span_m > 1.20:
+            l_span = 0.8
+        elif span_m < 0.50:
+            l_span = -0.6
+        else:
+            l_span = 0.0
+
+        # 5. Recursive Bayesian Fusion (weighted update with temporal smoothing)
+        w_vis = 1.0 if l_visual != 0.0 else 0.0
+        w_kin = 0.7 if speed_kmh is not None and speed_kmh > 0.5 else 0.0
+        w_geom = 1.0
+        w_span = 0.5
+
+        delta_log_odds = (w_vis * l_visual) + (w_kin * l_kin) + (w_geom * l_geom) + (w_span * l_span)
+        self.log_odds = 0.85 * self.log_odds + delta_log_odds
+
+        # Bound log odds to prevent saturation [-5.0, 5.0]
+        self.log_odds = max(-5.0, min(5.0, self.log_odds))
+        self.military_prob = 1.0 / (1.0 + math.exp(-self.log_odds))
+
+        # Decision
+        if self.military_prob >= 0.52:
+            domain = "MILITARY"
+            conf = self.military_prob
+            if visual_label and str(visual_label).lower() not in ["civilian", "military", "unknown"]:
+                type_name = str(visual_label)
+            else:
+                type_name = "Tactical-Wing"
+        else:
+            domain = "CIVILIAN"
+            conf = 1.0 - self.military_prob
+            if visual_label and str(visual_label).lower() not in ["civilian", "military", "unknown"]:
+                type_name = str(visual_label)
+            else:
+                if aspect_ratio >= 1.4:
+                    type_name = "Quadcopter-UAV"
+                else:
+                    type_name = "Micro-Mini"
+
+        return domain, type_name, conf
+
+
 class TargetKinematics:
     def __init__(self, track_id):
         self.track_id = track_id
@@ -495,7 +591,7 @@ class TargetKinematics:
         self.speed_kmh = 0.0
         self.approach_rate = 0.0  # m/s (+ approaching, - receding)
         self.eta_seconds = None
-        self.type_votes = {}
+        self.bayes_classifier = BayesianDroneClassifier()
         self.cached_type = "UNKNOWN"
         self.cached_domain = "UNKNOWN"
         self.cached_type_score = 0.0
@@ -810,7 +906,7 @@ while True:
                 continue
             if aspect_ratio > 4.5:
                 continue
-            if (box_w * box_h) > (0.60 * w * h):
+            if (box_w * box_h) > (0.65 * w * h):
                 continue
 
             # 2. Optical Hollow-Lens & Tall Human Rejection Filter:
