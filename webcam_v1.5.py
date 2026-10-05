@@ -897,7 +897,13 @@ print("=" * 65 + "\n")
 # ---------------------------------------------------------
 current_frame = None
 latest_box_width = None
+latest_bbox = None
 latest_target_width = target_nominal_profile["width"]
+online_dataset_dir = Path("datasets/online_dataset")
+online_img_dir = online_dataset_dir / "images" / "train"
+online_lbl_dir = online_dataset_dir / "labels" / "train"
+online_img_dir.mkdir(parents=True, exist_ok=True)
+online_lbl_dir.mkdir(parents=True, exist_ok=True)
 calib_status_text = f"Loaded F={FOCAL_LENGTH_PX:.1f}px from file" if saved_focal_len else ""
 calib_status_expiry = time.time() + 3.0 if saved_focal_len else 0
 
@@ -1134,6 +1140,7 @@ while True:
         sbox_h = max(2, sy2 - sy1)
 
         latest_box_width = sbox_w
+        latest_bbox = (sx1, sy1, sx2, sy2)
         latest_target_width = distance_profile["width"]
 
         # Record Telemetry for Digital Twin & Flight Log
@@ -1320,16 +1327,16 @@ while True:
     clahe_tag = "[ON]" if clahe_enabled else ""
     gru_hud_tag = "[ON]" if USE_GRU_CORRECTION else "[OFF]"
     if is_video_file:
-        controls_msg = f"[S]: Shot | [G]: GRU{gru_hud_tag} | [K]: Calib | [SPACE]: Pause | [R]: Replay | Sens: [ / ] | Q: Quit"
+        controls_msg = f"[L]: Learn | [U]: Reload Model | [S]: Shot | [G]: GRU{gru_hud_tag} | [K]: Calib | [SPACE]: Pause | Sens: [ / ] | Q: Quit"
     else:
-        controls_msg = f"[S]: Shot | [G]: GRU{gru_hud_tag} | [K]: Calib | [C]: Contrast{clahe_tag} | Sens: [ / ] | Mode: [T] | Q: Quit"
+        controls_msg = f"[L]: Learn | [U]: Reload Model | [S]: Shot | [G]: GRU{gru_hud_tag} | [K]: Calib | [C]: Contrast{clahe_tag} | Sens: [ / ] | Q: Quit"
         
-    (cw, _), _ = cv2.getTextSize(controls_msg, cv2.FONT_HERSHEY_SIMPLEX, 0.40, 1)
-    cv2.putText(frame, controls_msg, (w - cw - 15, h - 17), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (180, 180, 180), 1, cv2.LINE_AA)
+    (cw, _), _ = cv2.getTextSize(controls_msg, cv2.FONT_HERSHEY_SIMPLEX, 0.38, 1)
+    cv2.putText(frame, controls_msg, (w - cw - 15, h - 17), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (190, 190, 190), 1, cv2.LINE_AA)
 
     # Calibration / Screenshot Status Banner Overlay
     if calib_status_text and time.time() < calib_status_expiry:
-        banner_w = 540
+        banner_w = 600
         banner_h = 32
         bx1 = (w - banner_w) // 2
         by1 = h - footer_h - banner_h - 10
@@ -1346,6 +1353,44 @@ while True:
     key = cv2.waitKey(wait_delay) & 0xFF
     if key in (ord("q"), ord("Q"), 27):
         break
+    elif key in (ord("l"), ord("L")):  # L: Capture Sample for Online Learning Dataset
+        if latest_bbox is None or current_frame is None:
+            calib_status_text = "WARN: No Target Box to Capture. Keep drone in view!"
+            calib_status_expiry = time.time() + 3.0
+            print("[!] No drone bounding box visible to capture. Keep drone in frame.")
+        else:
+            ts_str = time.strftime("%Y%m%d_%H%M%S") + f"_{int(time.time()*1000)%1000:03d}"
+            sample_img_name = f"sample_{ts_str}.jpg"
+            sample_lbl_name = f"sample_{ts_str}.txt"
+            
+            # Save unannotated raw camera frame
+            cv2.imwrite(str(online_img_dir / sample_img_name), current_frame, [cv2.IMWRITE_JPEG_QUALITY, 98])
+            
+            # Save normalized YOLO format label: 0 cx cy nw nh
+            bx1, by1, bx2, by2 = latest_bbox
+            cx_n = ((bx1 + bx2) / 2.0) / float(w)
+            cy_n = ((by1 + by2) / 2.0) / float(h)
+            w_n = max(0.005, (bx2 - bx1) / float(w))
+            h_n = max(0.005, (by2 - by1) / float(h))
+            
+            with open(online_lbl_dir / sample_lbl_name, "w") as f_lbl:
+                f_lbl.write(f"0 {cx_n:.6f} {cy_n:.6f} {w_n:.6f} {h_n:.6f}\n")
+                
+            total_samples = len(list(online_img_dir.glob("*.jpg")))
+            calib_status_text = f"ONLINE DATASET: +1 SAMPLE (Total: {total_samples})"
+            calib_status_expiry = time.time() + 3.5
+            print(f"[+] Captured Online Learning Sample: {sample_img_name} (Total: {total_samples})")
+    elif key in (ord("u"), ord("U")):  # U: Hot-Reload Trained Model Weights
+        print(f"[*] Hot-Reloading YOLO Model weights from: {MODEL_PATH}")
+        try:
+            model = YOLO(MODEL_PATH)
+            calib_status_text = f"MODEL RELOADED: {MODEL_PATH} ACTIVE"
+            calib_status_expiry = time.time() + 4.0
+            print(f"[SUCCESS] Model Reloaded successfully into memory!")
+        except Exception as e:
+            calib_status_text = f"ERROR Reloading Model: {e}"
+            calib_status_expiry = time.time() + 4.0
+            print(f"[!] Error reloading model: {e}")
     elif key in (ord("s"), ord("S")):  # S: Take High-Res Screenshot of Full HUD & Detection Screen
         screenshots_dir = Path("screenshots")
         screenshots_dir.mkdir(parents=True, exist_ok=True)
