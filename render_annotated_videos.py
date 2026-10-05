@@ -132,14 +132,36 @@ def render_video(video_path, gt_dist, out_path, yolo_model, type_classifier, gru
             break
         frame_idx += 1
         
-        # Run detection
-        results = yolo_model(frame, conf=0.15, verbose=False)
-        has_detection = results and len(results[0].boxes) > 0
+        # Run ByteTrack Tracking with drone aspect-ratio and size filtering
+        results = yolo_model.track(frame, persist=True, tracker="bytetrack.yaml", conf=0.25, verbose=False)
+        has_detection = False
+        best_box = None
+        best_conf = 0.0
+        
+        if results and len(results[0].boxes) > 0:
+            for b in results[0].boxes:
+                c = float(b.conf[0])
+                x1_t, y1_t, x2_t, y2_t = map(float, b.xyxy[0])
+                bw_t = x2_t - x1_t
+                bh_t = y2_t - y1_t
+                ar_t = bw_t / max(1.0, bh_t)
+                
+                # Filter out giant false positives (ceiling trays, whole screen boxes)
+                if (bw_t * bh_t) > (0.30 * w * h):
+                    continue
+                # Filter out extreme elongated cable lines
+                if ar_t > 3.5 or ar_t < 0.35:
+                    continue
+                if bw_t < 15 or bh_t < 12:
+                    continue
+                if c > best_conf:
+                    best_conf = c
+                    best_box = b
+                    has_detection = True
         
         disp_frame = frame.copy()
         
-        if has_detection:
-            best_box = max(results[0].boxes, key=lambda b: float(b.conf[0]))
+        if has_detection and best_box is not None:
             bx1, by1, bx2, by2 = map(float, best_box.xyxy[0])
             conf = float(best_box.conf[0])
             
@@ -149,7 +171,7 @@ def render_video(video_path, gt_dist, out_path, yolo_model, type_classifier, gru
             v_center = (by1 + by2) / 2.0
             cx_cam, cy_cam = w / 2.0, h / 2.0
             
-            # Type classification
+            # Type classification on tight crop
             crop = frame[int(max(0, by1)):int(min(h, by2)), int(max(0, bx1)):int(min(w, bx2))]
             drone_type = "DJI-Neo"
             type_score = 0.94
@@ -186,9 +208,9 @@ def render_video(video_path, gt_dist, out_path, yolo_model, type_classifier, gru
             if len(feature_buffer) > 30:
                 feature_buffer.pop(0)
                 
-            # 2. GRU Residual Correction
-            if gru_predictor.enabled and len(feature_buffer) >= 10:
-                delta_d = gru_predictor.predict_correction(feature_buffer[-10:])
+            # 2. GRU Residual Correction (Instant from Frame 1 via Warmup Padding)
+            if gru_predictor.enabled and len(feature_buffer) >= 1:
+                delta_d = gru_predictor.predict_correction(feature_buffer)
                 d_gru = max(0.1, d2_dist + delta_d)
             else:
                 delta_d = 0.0

@@ -113,14 +113,22 @@ class DistanceResidualPredictor:
 
     def predict_correction(self, feature_sequence):
         """
-        feature_sequence: list or array of shape (N >= seq_len, 9)
+        feature_sequence: list or array of shape (N, 9)
         Returns: delta_D in meters (float)
         """
-        if not self.enabled or self.model is None or len(feature_sequence) < self.seq_len:
+        if not self.enabled or self.model is None or len(feature_sequence) == 0:
             return 0.0
             
         try:
-            seq_np = np.array(feature_sequence[-self.seq_len:], dtype=np.float32)
+            if len(feature_sequence) < self.seq_len:
+                # Warmup padding: repeat the earliest available frame to fill 10-step buffer
+                first_elem = feature_sequence[0]
+                pad_count = self.seq_len - len(feature_sequence)
+                padded_seq = [first_elem] * pad_count + list(feature_sequence)
+                seq_np = np.array(padded_seq, dtype=np.float32)
+            else:
+                seq_np = np.array(feature_sequence[-self.seq_len:], dtype=np.float32)
+
             norm_seq = self.normalize(seq_np)
             tensor = torch.tensor(norm_seq, dtype=torch.float32).unsqueeze(0).to(self.device)
             with torch.no_grad():
