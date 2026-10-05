@@ -262,7 +262,11 @@ def render_video(video_path, gt_dist, out_path, yolo_model, type_classifier, gru
             badge_line2 = f"DIST: {disp_z:.2f}m{gru_tag_str}  (CRLB: {err_str})"
             badge_line3 = f"MOTION: {motion_str}"
             
-            badge_w = max(500, int(bw + 120))
+            # Target Reticle Badge (Compact 3-Line Tactical Display)
+            (bw1, _), _ = cv2.getTextSize(badge_line1, cv2.FONT_HERSHEY_DUPLEX, 0.54, 1)
+            (bw2, _), _ = cv2.getTextSize(badge_line2, cv2.FONT_HERSHEY_DUPLEX, 0.58, 1)
+            (bw3, _), _ = cv2.getTextSize(badge_line3, cv2.FONT_HERSHEY_DUPLEX, 0.46, 1)
+            badge_w = max(440, max(bw1, bw2, bw3) + 32)
             badge_h = 92
             badge_y1 = max(46, sy1 - badge_h - 8)
             badge_y2 = sy1 - 8
@@ -276,24 +280,31 @@ def render_video(video_path, gt_dist, out_path, yolo_model, type_classifier, gru
             
             cv2.rectangle(disp_frame, (bx1_b, by1_b), (bx2_b, by2_b), (10, 10, 10), -1)
             cv2.rectangle(disp_frame, (bx1_b, by1_b), (bx2_b, by2_b), (0, 255, 0), 2)
-            cv2.putText(disp_frame, badge_line1, (bx1_b + 12, by1_b + 24), cv2.FONT_HERSHEY_DUPLEX, 0.58, (255, 255, 255), 1, cv2.LINE_AA)
-            cv2.putText(disp_frame, badge_line2, (bx1_b + 12, by1_b + 52), cv2.FONT_HERSHEY_DUPLEX, 0.62, (0, 255, 0), 1, cv2.LINE_AA)
-            cv2.putText(disp_frame, badge_line3, (bx1_b + 12, by1_b + 78), cv2.FONT_HERSHEY_DUPLEX, 0.50, motion_color, 1, cv2.LINE_AA)
+            cv2.putText(disp_frame, badge_line1, (bx1_b + 14, by1_b + 25), cv2.FONT_HERSHEY_DUPLEX, 0.54, (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.putText(disp_frame, badge_line2, (bx1_b + 14, by1_b + 52), cv2.FONT_HERSHEY_DUPLEX, 0.58, (0, 255, 0), 1, cv2.LINE_AA)
+            cv2.putText(disp_frame, badge_line3, (bx1_b + 14, by1_b + 78), cv2.FONT_HERSHEY_DUPLEX, 0.46, motion_color, 1, cv2.LINE_AA)
             
             # Corner Tactical Telemetry Card
-            card_x1, card_y1 = 16, 52
-            card_w, card_h = 560, 110
-            cv2.rectangle(disp_frame, (card_x1, card_y1), (card_x1 + card_w, card_y1 + card_h), (12, 12, 12), -1)
-            cv2.rectangle(disp_frame, (card_x1, card_y1), (card_x1 + card_w, card_y1 + card_h), (0, 200, 0), 2)
-            cv2.rectangle(disp_frame, (card_x1, card_y1), (card_x1 + card_w, card_y1 + 28), (0, 140, 0), -1)
-            
+            card_x1, card_y1 = 16, 50
             c_head = f"TACTICAL TELEMETRY | TARGET [ID: 1] : {drone_type.upper()}"
             c_dist = f"DISTANCE :  {disp_z:.2f} m{gru_tag_str}  [GT: {gt_dist:.2f}m | CRLB: {err_str}]"
             c_mot = f"KINEMATICS:  {motion_str}  [SPAN: 16x5cm]"
+
+            (tw_hdr, _), _ = cv2.getTextSize(c_head, cv2.FONT_HERSHEY_DUPLEX, 0.50, 1)
+            (tw_dist, _), _ = cv2.getTextSize(c_dist, cv2.FONT_HERSHEY_DUPLEX, 0.56, 1)
+            (tw_mot, _), _ = cv2.getTextSize(c_mot, cv2.FONT_HERSHEY_DUPLEX, 0.46, 1)
+
+            card_w = max(620, min(w - card_x1 - 16, max(tw_hdr, tw_dist, tw_mot) + 36))
+            card_h = 106
+            card_x2, card_y2 = card_x1 + card_w, card_y1 + card_h
+
+            cv2.rectangle(disp_frame, (card_x1, card_y1), (card_x2, card_y2), (12, 12, 12), -1)
+            cv2.rectangle(disp_frame, (card_x1, card_y1), (card_x2, card_y2), (0, 200, 0), 2)
+            cv2.rectangle(disp_frame, (card_x1, card_y1), (card_x2, card_y1 + 26), (0, 140, 0), -1)
             
-            cv2.putText(disp_frame, c_head, (card_x1 + 12, card_y1 + 20), cv2.FONT_HERSHEY_DUPLEX, 0.54, (255, 255, 255), 1, cv2.LINE_AA)
-            cv2.putText(disp_frame, c_dist, (card_x1 + 12, card_y1 + 54), cv2.FONT_HERSHEY_DUPLEX, 0.64, (0, 255, 0), 2, cv2.LINE_AA)
-            cv2.putText(disp_frame, c_mot, (card_x1 + 12, card_y1 + 88), cv2.FONT_HERSHEY_DUPLEX, 0.50, motion_color, 1, cv2.LINE_AA)
+            cv2.putText(disp_frame, c_head, (card_x1 + 14, card_y1 + 19), cv2.FONT_HERSHEY_DUPLEX, 0.50, (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.putText(disp_frame, c_dist, (card_x1 + 14, card_y1 + 53), cv2.FONT_HERSHEY_DUPLEX, 0.56, (0, 255, 0), 2, cv2.LINE_AA)
+            cv2.putText(disp_frame, c_mot, (card_x1 + 14, card_y1 + 86), cv2.FONT_HERSHEY_DUPLEX, 0.46, motion_color, 1, cv2.LINE_AA)
             
         # Top Header Bar
         hdr_color = (0, 140, 0) if has_detection else (30, 30, 30)

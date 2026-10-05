@@ -438,6 +438,48 @@ def is_human_or_face_false_positive(crop_bgr, aspect_ratio, confidence):
         
     return False
 
+def is_furniture_or_background_false_positive(crop_bgr, bbox, frame_h, frame_w, confidence):
+    """
+    Discriminates office furniture, chairs, tables, wall dividers, and static indoor clutter from real drones.
+    - Large floor-anchored objects (office chairs touching bottom screen border).
+    - Oversized low-confidence indoor regions.
+    - Textureless or uniform dark chair fabric surfaces.
+    """
+    if crop_bgr is None or crop_bgr.size == 0:
+        return True
+
+    x1, y1, x2, y2 = bbox
+    bw = x2 - x1
+    bh = y2 - y1
+
+    # 1. Floor-anchored large objects (office chairs, desk pedestals, wheel bases)
+    # If bottom of bounding box is near the bottom edge (floor) and spans >24% of screen height with confidence < 0.60
+    if y2 >= 0.88 * frame_h and bh > 0.24 * frame_h and confidence < 0.60:
+        return True
+
+    # 2. Overly massive indoor boxes (taking up large fraction of screen) with sub-60% confidence
+    if (bw * bh) > (0.15 * frame_w * frame_h) and confidence < 0.60:
+        return True
+
+    # 3. Flat wall panels / desk dividers / office ceiling fixtures with extreme aspect ratio
+    ar = float(bw) / max(1.0, float(bh))
+    if (ar < 0.40 or ar > 3.2) and confidence < 0.55:
+        return True
+
+    # 4. Homogeneous Dark / Textureless Chair Fabric & Wall Surfaces
+    if crop_bgr.shape[0] >= 30 and crop_bgr.shape[1] >= 30 and confidence < 0.52:
+        gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, 40, 120)
+        edge_density = np.count_nonzero(edges) / max(1, edges.size)
+        # Real drones have structured rotor blades/ducts/chassis (> 2.0% edge density)
+        if edge_density < 0.018:
+            return True
+        # Chair cushions/backs: very dark with low internal texture variance
+        if np.mean(gray) < 45 and edge_density < 0.026:
+            return True
+
+    return False
+
 # ---------------------------------------------------------
 # 4. KINEMATIC TRACKER MEMORY (3D State, Dynamic CRLB Kalman Filter)
 # ---------------------------------------------------------
@@ -817,8 +859,8 @@ tracks_db = {}
 MIN_CONSECUTIVE_FRAMES = 1  # Instant response for small mini drones
 MAX_MISSED_FRAMES = 25      # Generous track retention for hand-held & distant tests
 
-# UI State (Default 35% sensitivity: clean noise-free drone tracking)
-conf_percent = 35
+# UI State (Default 45% sensitivity: clean noise-free drone tracking)
+conf_percent = 45
 brightness_boost = 0
 clahe_enabled = False
 dragging_slider = False
@@ -959,11 +1001,13 @@ while True:
             if (box_w * box_h) > (0.65 * w * h):
                 continue
 
-            # 2. Optical Hollow-Lens & Tall Human Rejection Filter:
+            # 2. Optical Hollow-Lens, Human Skin, and Furniture Rejection Filter:
             crop = frame[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
             if is_hollow_eyeglasses(crop):
                 continue
             if is_human_or_face_false_positive(crop, aspect_ratio, confidence):
+                continue
+            if is_furniture_or_background_false_positive(crop, (x1, y1, x2, y2), h, w, confidence):
                 continue
 
             if track_id not in tracks_db:
@@ -1056,7 +1100,7 @@ while True:
             continue
 
         conf = target_kin.last_conf
-        is_confirmed = (conf >= 0.18) or (target_kin.hits >= 3 and target_kin.missed_frames <= 3)
+        is_confirmed = (conf >= 0.40) or (target_kin.hits >= 4 and conf >= 0.28 and target_kin.missed_frames <= 2)
         if not is_confirmed:
             continue
 
@@ -1155,8 +1199,11 @@ while True:
         badge_line2 = f"DIST: {disp_z:.2f}m{gru_tag_str}  (CRLB: {err_str})"
         badge_line3 = f"MOTION: {motion_str}"
 
-        # Target Bounding Box Badge Dimensions (Compact 3-Line Tactical Badge)
-        badge_w = max(500, int(sbox_w + 120))
+        # Target Bounding Box Badge Dimensions (Dynamic Auto-Fitting)
+        (bw1, _), _ = cv2.getTextSize(badge_line1, cv2.FONT_HERSHEY_DUPLEX, 0.54, 1)
+        (bw2, _), _ = cv2.getTextSize(badge_line2, cv2.FONT_HERSHEY_DUPLEX, 0.58, 1)
+        (bw3, _), _ = cv2.getTextSize(badge_line3, cv2.FONT_HERSHEY_DUPLEX, 0.46, 1)
+        badge_w = max(440, max(bw1, bw2, bw3) + 32)
         badge_h = 92
         badge_y1 = max(46, sy1 - badge_h - 8)
         badge_y2 = sy1 - 8
@@ -1174,29 +1221,33 @@ while True:
             cv2.rectangle(frame, (bx1, by1), (bx2, by2), (10, 10, 10), -1)
             cv2.rectangle(frame, (bx1, by1), (bx2, by2), (0, 255, 0), 2)
 
-            cv2.putText(frame, badge_line1, (bx1 + 12, by1 + 24), cv2.FONT_HERSHEY_DUPLEX, 0.58, (255, 255, 255), 1, cv2.LINE_AA)
-            cv2.putText(frame, badge_line2, (bx1 + 12, by1 + 52), cv2.FONT_HERSHEY_DUPLEX, 0.62, (0, 255, 0), 1, cv2.LINE_AA)
-            cv2.putText(frame, badge_line3, (bx1 + 12, by1 + 78), cv2.FONT_HERSHEY_DUPLEX, 0.50, motion_color, 1, cv2.LINE_AA)
+            cv2.putText(frame, badge_line1, (bx1 + 14, by1 + 25), cv2.FONT_HERSHEY_DUPLEX, 0.54, (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.putText(frame, badge_line2, (bx1 + 14, by1 + 52), cv2.FONT_HERSHEY_DUPLEX, 0.58, (0, 255, 0), 1, cv2.LINE_AA)
+            cv2.putText(frame, badge_line3, (bx1 + 14, by1 + 78), cv2.FONT_HERSHEY_DUPLEX, 0.46, motion_color, 1, cv2.LINE_AA)
 
-        # --- CORNER TACTICAL TELEMETRY CARD (Fixed Top-Left HUD Card) ---
+        # --- CORNER TACTICAL TELEMETRY CARD (Dynamic Auto-Fitting Top-Left HUD Card) ---
         if confirmed_drone_count == 1:
-            card_x1, card_y1 = 16, 52
-            card_w, card_h = 560, 110
+            card_x1, card_y1 = 16, 50
+            c_header = f"TACTICAL TELEMETRY | TARGET [ID:{tid}] : {drone_type.upper()}"
+            c_dist = f"DISTANCE :  {disp_z:.2f} m{gru_tag_str}   [CRLB: {err_str} | 95% CI: {ci_str}]"
+            c_mot = f"KINEMATICS:  {motion_str}  [SPAN: {distance_profile['width']*100:.0f}x{target_h_cm:.0f}cm]"
+
+            (tw_hdr, _), _ = cv2.getTextSize(c_header, cv2.FONT_HERSHEY_DUPLEX, 0.50, 1)
+            (tw_dist, _), _ = cv2.getTextSize(c_dist, cv2.FONT_HERSHEY_DUPLEX, 0.56, 1)
+            (tw_mot, _), _ = cv2.getTextSize(c_mot, cv2.FONT_HERSHEY_DUPLEX, 0.46, 1)
+
+            card_w = max(620, min(w - card_x1 - 16, max(tw_hdr, tw_dist, tw_mot) + 36))
+            card_h = 106
             card_x2, card_y2 = card_x1 + card_w, card_y1 + card_h
             
             # Matte Black Panel with Neon Accent
             cv2.rectangle(frame, (card_x1, card_y1), (card_x2, card_y2), (12, 12, 12), -1)
             cv2.rectangle(frame, (card_x1, card_y1), (card_x2, card_y2), (0, 200, 0), 2)
-            cv2.rectangle(frame, (card_x1, card_y1), (card_x2, card_y1 + 28), (0, 140, 0), -1)
+            cv2.rectangle(frame, (card_x1, card_y1), (card_x2, card_y1 + 26), (0, 140, 0), -1)
             
-            c_header = f"TACTICAL TELEMETRY | TARGET [ID:{tid}] : {drone_type.upper()}"
-            cv2.putText(frame, c_header, (card_x1 + 12, card_y1 + 20), cv2.FONT_HERSHEY_DUPLEX, 0.54, (255, 255, 255), 1, cv2.LINE_AA)
-            
-            c_dist = f"DISTANCE :  {disp_z:.2f} m{gru_tag_str}   [CRLB: {err_str} | 95% CI: {ci_str}]"
-            cv2.putText(frame, c_dist, (card_x1 + 12, card_y1 + 54), cv2.FONT_HERSHEY_DUPLEX, 0.66, (0, 255, 0), 2, cv2.LINE_AA)
-            
-            c_mot = f"KINEMATICS:  {motion_str}  [SPAN: {distance_profile['width']*100:.0f}x{target_h_cm:.0f}cm]"
-            cv2.putText(frame, c_mot, (card_x1 + 12, card_y1 + 88), cv2.FONT_HERSHEY_DUPLEX, 0.50, motion_color, 1, cv2.LINE_AA)
+            cv2.putText(frame, c_header, (card_x1 + 14, card_y1 + 19), cv2.FONT_HERSHEY_DUPLEX, 0.50, (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.putText(frame, c_dist, (card_x1 + 14, card_y1 + 53), cv2.FONT_HERSHEY_DUPLEX, 0.56, (0, 255, 0), 2, cv2.LINE_AA)
+            cv2.putText(frame, c_mot, (card_x1 + 14, card_y1 + 86), cv2.FONT_HERSHEY_DUPLEX, 0.46, motion_color, 1, cv2.LINE_AA)
 
 
     # Periodic Telemetry CSV Append
