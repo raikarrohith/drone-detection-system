@@ -859,8 +859,8 @@ tracks_db = {}
 MIN_CONSECUTIVE_FRAMES = 1  # Instant response for small mini drones
 MAX_MISSED_FRAMES = 25      # Generous track retention for hand-held & distant tests
 
-# UI State (Default 45% sensitivity: clean noise-free drone tracking)
-conf_percent = 45
+# UI State (Default 30% sensitivity: fast lock on textured backgrounds & distance)
+conf_percent = 30
 brightness_boost = 0
 clahe_enabled = False
 dragging_slider = False
@@ -950,9 +950,9 @@ while True:
     cx_cam = w / 2.0
     cy_cam = h / 2.0
     if calibrated_focal_length_px is not None:
-        FOCAL_LENGTH_PX = calibrated_focal_length_px * (float(w) / 1920.0)
+        FOCAL_LENGTH_PX = calibrated_focal_length_px
     else:
-        FOCAL_LENGTH_PX = (float(w) / 1920.0) * 1350.0
+        FOCAL_LENGTH_PX = 1060.0
 
     conf_threshold = conf_percent / 100.0
 

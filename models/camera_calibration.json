@@ -1,16 +1,24 @@
 {
+    "focal_length_px": 1062.0,
     "cameras": {
-        "camera_1": {
-            "focal_length_px": 987.5,
+        "camera_0": {
+            "focal_length_px": 1062.0,
             "resolution": "1920x1080",
-            "calibrated_at": "2026-09-29 14:45:33",
+            "calibrated_at": "2026-10-05 12:35:00",
             "calibration_distance_m": 1.0,
             "target_width_m": 0.16
         },
-        "camera_0": {
-            "focal_length_px": 1350.0,
+        "camera_1": {
+            "focal_length_px": 1062.0,
             "resolution": "1920x1080",
-            "calibrated_at": "2026-09-29 14:05:00",
+            "calibrated_at": "2026-10-05 12:35:00",
+            "calibration_distance_m": 1.0,
+            "target_width_m": 0.16
+        },
+        "camera_default": {
+            "focal_length_px": 1062.0,
+            "resolution": "1920x1080",
+            "calibrated_at": "2026-10-05 12:35:00",
             "calibration_distance_m": 1.0,
             "target_width_m": 0.16
         }
