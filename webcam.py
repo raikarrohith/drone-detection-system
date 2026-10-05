@@ -232,7 +232,7 @@ CALIBRATION_RELATIVE_UNCERTAINTY = 0.05 if calibrated_focal_length_px is not Non
 BBOX_TIGHTNESS = 0.98      # Tight airframe fitting factor (minimizes loose margin)
 EMA_SMOOTH_MIN = 0.65      # Strong temporal smoothing factor for stationary/hovering targets (kills jitter)
 EMA_SMOOTH_MAX = 0.90      # Dynamic smoothing factor for high-speed maneuvering targets
-MAX_COAST_FRAMES = 6       # 6-frame coasting buffer to eliminate flicker on sideways profile rotations
+MAX_COAST_FRAMES = 12      # 12-frame coasting buffer to eliminate flicker and hold solid target lock
 
 # Drone Physical Size Profiles (Wingspan, Height, and Diagonal in meters)
 DRONE_PROFILES = {
@@ -1008,10 +1008,22 @@ while True:
             if is_furniture_or_background_false_positive(crop, (x1, y1, x2, y2), h, w, confidence):
                 continue
 
-            if track_id not in tracks_db:
-                tracks_db[track_id] = TargetKinematics(track_id)
-            target_kin = tracks_db[track_id]
-            active_frame_track_ids.add(track_id)
+            # Spatial Proximity Re-association (Preserves Track Lock when ByteTrack drops/reassigns ID)
+            active_tid = track_id
+            u_det = (x1 + x2) / 2.0
+            v_det = (y1 + y2) / 2.0
+            det_span = max(box_w, box_h)
+            for exist_tid, exist_kin in tracks_db.items():
+                if exist_kin.smoothed_bbox is not None and exist_kin.missed_frames > 0:
+                    dist = math.hypot(u_det - exist_kin.last_u_center, v_det - exist_kin.last_v_center)
+                    if dist < max(100.0, 2.0 * det_span):
+                        active_tid = exist_tid
+                        break
+
+            if active_tid not in tracks_db:
+                tracks_db[active_tid] = TargetKinematics(active_tid)
+            target_kin = tracks_db[active_tid]
+            active_frame_track_ids.add(active_tid)
 
             # 3. Dynamic Airframe Classification (Rate-limited for zero lag)
             should_classify = False
@@ -1055,10 +1067,10 @@ while True:
                 tightness=1.0
             )
 
-    # Phase 2: Coast / Dead-Reckon tracks missed in this frame (with Spatial Duplicate Suppression)
+    # Phase 2: Coast / Dead-Reckon tracks missed in this frame (Hold target lock without flicker)
     for tid, target_kin in list(tracks_db.items()):
         if tid not in active_frame_track_ids:
-            # Check if this coasted track is a duplicate ghost of any active detection (e.g. after rapid motion)
+            # Check if this coasted track is a duplicate ghost of any active detection
             is_duplicate = False
             if active_frame_track_ids and target_kin.smoothed_bbox is not None:
                 for active_id in active_frame_track_ids:
@@ -1069,36 +1081,31 @@ while True:
                         dist = math.hypot(dx, dy)
                         ax1, ay1, ax2, ay2 = active_kin.smoothed_bbox
                         active_span = max(ax2 - ax1, ay2 - ay1)
-                        # If nearby (within 1.5x active box span or 120px), suppress the old ghost track
                         if dist < max(120.0, 1.5 * active_span):
                             is_duplicate = True
                             break
 
             if is_duplicate:
-                target_kin.missed_frames = MAX_COAST_FRAMES + 1  # Expire immediately
+                target_kin.missed_frames = MAX_COAST_FRAMES + 1  # Expire duplicate immediately
             elif target_kin.hits >= 2 and target_kin.missed_frames < MAX_COAST_FRAMES:
                 target_kin.coast(dt)
             else:
                 target_kin.missed_frames += 1
-
-    # Phase 2: Maintain target lock during brief frame drops (Locks on target without drift)
-    for tid, target_kin in list(tracks_db.items()):
-        if tid not in active_frame_track_ids:
-            target_kin.missed_frames += 1
-            if target_kin.kalman_filter is not None:
-                target_kin.kalman_filter.predict(dt)
+                if target_kin.kalman_filter is not None:
+                    target_kin.kalman_filter.predict(dt)
 
     # Phase 3: Render all locked drone targets (Strictly Green, Solid Rock Lock, Zero Flicker)
     for tid, target_kin in list(tracks_db.items()):
         if target_kin.smoothed_bbox is None:
             continue
             
-        # Hold firm target lock across 1-4 missed frames so the box never flickers or drops
-        if target_kin.missed_frames > 4:
+        # Hold firm target lock across up to MAX_COAST_FRAMES so the box never drops or flickers
+        if target_kin.missed_frames > MAX_COAST_FRAMES:
             continue
 
         conf = target_kin.last_conf
-        is_confirmed = (conf >= conf_threshold) or (target_kin.hits >= 3 and conf >= 0.22 and target_kin.missed_frames <= 3)
+        # Solid Lock: Active if high confidence OR established track within coasting buffer
+        is_confirmed = (conf >= conf_threshold) or (target_kin.hits >= 2 and target_kin.missed_frames <= MAX_COAST_FRAMES)
         if not is_confirmed:
             continue
 
