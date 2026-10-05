@@ -49,7 +49,7 @@ elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
     print("[*] Hardware Acceleration: Apple Silicon Metal GPU (High Performance)")
 else:
     DEVICE = "cpu"
-    current_imgsz = args.imgsz if args.imgsz is not None else 640
+    current_imgsz = args.imgsz if args.imgsz is not None else 960
     torch.set_num_threads(min(8, os.cpu_count() or 4))
     print(f"[*] Hardware Acceleration: Multi-Threaded CPU ({torch.get_num_threads()} threads, imgsz={current_imgsz})")
 
@@ -956,12 +956,12 @@ while True:
 
     conf_threshold = conf_percent / 100.0
 
-    # Hardware-Accelerated YOLO Inference with High-Sensitivity Multi-Stage Tracking
+    # Hardware-Accelerated YOLO Inference with Multi-Stage Temporal Tracking
     results = model.track(
         frame,
         persist=True,
         tracker="bytetrack.yaml",
-        conf=max(0.18, conf_threshold),
+        conf=0.20,
         iou=0.45,
         imgsz=current_imgsz,
         device=DEVICE,
@@ -983,7 +983,7 @@ while True:
             cls_id = int(box.cls[0])
             confidence = float(box.conf[0])
 
-            if cls_id != DRONE_CLASS_ID or confidence < max(0.18, conf_threshold):
+            if cls_id != DRONE_CLASS_ID or confidence < 0.20:
                 continue
 
             track_id = int(box.id[0]) if box.id is not None else 1
@@ -991,12 +991,10 @@ while True:
             box_w, box_h = (x2 - x1), (y2 - y1)
             aspect_ratio = float(box_w) / max(1.0, float(box_h))
 
-            # 1. Clutter & Flat Edge Rejection Filter (rejects desk lines, mousepads, camera pan motion blur)
-            if box_h < 14 or box_w < 14:
+            # 1. Clutter & Flat Edge Rejection Filter (preserves small distant drones down to 6px)
+            if box_w < 6 or box_h < 4:
                 continue
-            if aspect_ratio > 3.5 and confidence < 0.50:
-                continue
-            if aspect_ratio > 4.5:
+            if aspect_ratio > 5.5:
                 continue
             if (box_w * box_h) > (0.65 * w * h):
                 continue
@@ -1100,7 +1098,7 @@ while True:
             continue
 
         conf = target_kin.last_conf
-        is_confirmed = (conf >= 0.40) or (target_kin.hits >= 4 and conf >= 0.28 and target_kin.missed_frames <= 2)
+        is_confirmed = (conf >= conf_threshold) or (target_kin.hits >= 3 and conf >= 0.22 and target_kin.missed_frames <= 3)
         if not is_confirmed:
             continue
 
