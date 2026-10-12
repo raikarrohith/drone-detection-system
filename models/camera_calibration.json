@@ -1,5 +1,4 @@
 {
-    "focal_length_px": 1062.0,
     "cameras": {
         "camera_0": {
             "focal_length_px": 1062.0,
@@ -9,9 +8,9 @@
             "target_width_m": 0.16
         },
         "camera_1": {
-            "focal_length_px": 1062.0,
+            "focal_length_px": 1043.75,
             "resolution": "1920x1080",
-            "calibrated_at": "2026-10-05 12:35:00",
+            "calibrated_at": "2026-10-08 15:56:18",
             "calibration_distance_m": 1.0,
             "target_width_m": 0.16
         },

@@ -230,9 +230,8 @@ CALIBRATION_RELATIVE_UNCERTAINTY = 0.05 if calibrated_focal_length_px is not Non
 
 # Bounding Box Stabilization & Anti-Flicker Parameters
 BBOX_TIGHTNESS = 0.98      # Tight airframe fitting factor (minimizes loose margin)
-EMA_SMOOTH_MIN = 0.65      # Strong temporal smoothing factor for stationary/hovering targets (kills jitter)
-EMA_SMOOTH_MAX = 0.90      # Dynamic smoothing factor for high-speed maneuvering targets
-MAX_COAST_FRAMES = 12      # 12-frame coasting buffer to eliminate flicker and hold solid target lock
+MAX_COAST_FRAMES = 5       # 5-frame coasting buffer (absorbs 1-2 frame drops at 3m+ without lag)
+MAX_COAST_TIME = 0.35      # Maximum coasting duration in seconds
 
 # Drone Physical Size Profiles (Wingspan, Height, and Diagonal in meters)
 DRONE_PROFILES = {
@@ -314,8 +313,8 @@ def compute_crlb_distance(pixel_w, pixel_h, target_profile, focal_length, sigma_
 def refine_bbox_contours(frame, bbox):
     """
     Refines loose YOLO bounding boxes around real physical drones.
-    Trims off empty background margins and mirror tabletop reflections by analyzing
-    horizontal & vertical edge energy and structural intensity profiles.
+    Trims off empty background margins and tabletop reflections by analyzing
+    connected structural edge clusters.
     """
     x1, y1, x2, y2 = bbox
     h_img, w_img = frame.shape[:2]
@@ -325,54 +324,68 @@ def refine_bbox_contours(frame, bbox):
     y2 = max(y1 + 15, min(h_img, int(y2)))
     
     crop = frame[y1:y2, x1:x2]
-    if crop.size == 0 or crop.shape[0] < 20 or crop.shape[1] < 20:
+    if crop.size == 0 or crop.shape[0] < 12 or crop.shape[1] < 12:
         return bbox
         
     ch, cw = crop.shape[:2]
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
     
-    # Compute Sobel gradients
+    # Compute Sobel gradients and Canny edges
     gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
     mag = cv2.magnitude(gx, gy)
     mag = np.uint8(np.clip(mag, 0, 255))
+    canny = cv2.Canny(gray, 35, 110)
+    struct_mask = cv2.bitwise_or(canny, (mag > 40).astype(np.uint8) * 255)
     
-    # Canny edges with clean threshold
-    canny = cv2.Canny(gray, 40, 120)
-    struct_mask = cv2.bitwise_or(canny, (mag > 45).astype(np.uint8) * 255)
-    
-    # Horizontal projection (to find left and right airframe boundaries)
+    # Horizontal projection
     h_proj = np.sum(struct_mask > 0, axis=0)
-    # Vertical projection (to find top and bottom airframe boundaries)
+    # Vertical projection
     v_proj = np.sum(struct_mask > 0, axis=1)
     
-    min_col_pixels = max(4, int(0.08 * ch))
-    min_row_pixels = max(4, int(0.08 * cw))
+    min_col_pixels = max(2, int(0.06 * ch))
+    min_row_pixels = max(2, int(0.06 * cw))
     
     cols_active = np.where(h_proj >= min_col_pixels)[0]
     rows_active = np.where(v_proj >= min_row_pixels)[0]
     
-    if len(cols_active) > 4 and len(rows_active) > 4:
-        trim_x1 = cols_active[0]
-        trim_x2 = cols_active[-1]
-        trim_y1 = rows_active[0]
-        trim_y2 = rows_active[-1]
+    if len(cols_active) > 3 and len(rows_active) > 3:
+        # Check if there is a massive empty gap (> 25px with 0 edges) splitting distinct objects
+        segments = []
+        seg_start = cols_active[0]
+        for i in range(len(cols_active) - 1):
+            if cols_active[i+1] - cols_active[i] > 25:  # Large gap between disconnected objects
+                segments.append((seg_start, cols_active[i]))
+                seg_start = cols_active[i+1]
+        segments.append((seg_start, cols_active[-1]))
         
-        # When on a reflective desk, bottom edge is often near 70-80% height of the raw box
-        # If the lower 25% has lower edge density than upper part, trim the reflection
+        # Pick the most prominent segment (highest total edge energy)
+        best_seg = max(segments, key=lambda s: np.sum(struct_mask[:, s[0]:s[1]+1] > 0))
+        trim_x1, trim_x2 = best_seg
+        
+        # Recalculate vertical trim on the chosen segment
+        v_sub = np.sum(struct_mask[:, trim_x1:trim_x2+1] > 0, axis=1)
+        r_sub = np.where(v_sub >= max(2, int(0.06 * (trim_x2 - trim_x1))))[0]
+        if len(r_sub) > 3:
+            trim_y1 = r_sub[0]
+            trim_y2 = r_sub[-1]
+        else:
+            trim_y1 = rows_active[0]
+            trim_y2 = rows_active[-1]
+            
+        # Tabletop reflection trimming
         mid_y = (trim_y1 + trim_y2) // 2
-        upper_density = np.mean(v_proj[trim_y1:mid_y]) if mid_y > trim_y1 else 1.0
+        upper_density = np.mean(v_sub[trim_y1:mid_y]) if mid_y > trim_y1 else 1.0
         lower_quarter = int(trim_y1 + 0.75 * (trim_y2 - trim_y1))
         if lower_quarter < trim_y2:
-            lower_density = np.mean(v_proj[lower_quarter:trim_y2])
+            lower_density = np.mean(v_sub[lower_quarter:trim_y2])
             if lower_density < 0.35 * upper_density:
                 trim_y2 = lower_quarter
-        
+                
         new_w = (trim_x2 - trim_x1)
         new_h = (trim_y2 - trim_y1)
         
-        # Only accept refinement if it represents a valid drone body
-        if new_w >= 0.30 * cw and new_h >= 0.20 * ch:
+        if new_w >= 0.25 * cw and new_h >= 0.20 * ch:
             final_x1 = max(0, x1 + trim_x1)
             final_y1 = max(0, y1 + trim_y1)
             final_x2 = min(w_img - 1, x1 + trim_x2)
@@ -409,9 +422,9 @@ def is_hollow_eyeglasses(crop_bgr):
 
 def is_human_or_face_false_positive(crop_bgr, aspect_ratio, confidence):
     """
-    Discriminates humans, faces, and moving heads from airborne and desk drones.
-    - Dual HSV + YCrCb chrominance detects human facial skin across complexions and lighting.
-    - Rejects moving heads, faces, and nearby humans while preserving flying and desk drones (including sideways/tilted orientations).
+    Discriminates humans, faces, moving hands, and fingers from real drones.
+    - Dual HSV + YCrCb chrominance skin tone detection.
+    - Rejects moving hands, fingers, faces, and nearby humans while preserving real drones.
     """
     if crop_bgr is None or crop_bgr.size == 0:
         return False
@@ -424,26 +437,31 @@ def is_human_or_face_false_positive(crop_bgr, aspect_ratio, confidence):
     mask_hsv2 = cv2.inRange(hsv, np.array([168, 20, 40]), np.array([180, 255, 255]))
     mask_hsv = cv2.bitwise_or(mask_hsv1, mask_hsv2)
     
-    mask_ycrcb = cv2.inRange(ycrcb, np.array([0, 128, 70]), np.array([255, 182, 138]))
+    mask_ycrcb = cv2.inRange(ycrcb, np.array([0, 130, 75]), np.array([255, 180, 135]))
     skin_mask = cv2.bitwise_and(mask_hsv, mask_ycrcb)
     skin_ratio = np.count_nonzero(skin_mask) / max(1, skin_mask.size)
     
-    # Human face/head signature: requires actual skin tone presence (> 14%) on near-square/vertical crops
-    if aspect_ratio < 1.30 and skin_ratio > 0.14 and confidence < 0.70:
+    # Hand / finger or face intrusion:
+    # 1) Moving hand/finger entering view (skin_ratio > 10% on low/med confidence detections)
+    if skin_ratio > 0.10 and confidence < 0.75:
         return True
         
-    # High skin-tone coverage (> 22% regardless of aspect ratio) indicates hand/arm/body close-up
-    if skin_ratio > 0.22 and confidence < 0.65:
+    # 2) Dominant skin coverage (> 18%) regardless of aspect ratio
+    if skin_ratio > 0.18:
+        return True
+        
+    # 3) Vertical/square aspect ratio with skin (human head/face/arm)
+    if aspect_ratio < 1.35 and skin_ratio > 0.08 and confidence < 0.70:
         return True
         
     return False
 
 def is_furniture_or_background_false_positive(crop_bgr, bbox, frame_h, frame_w, confidence):
     """
-    Discriminates office furniture, chairs, tables, wall dividers, and static indoor clutter from real drones.
-    - Large floor-anchored objects (office chairs touching bottom screen border).
-    - Oversized low-confidence indoor regions.
-    - Textureless or uniform dark chair fabric surfaces.
+    Discriminates office furniture, chairs, tables, computer docks/cables, and static indoor clutter from real drones.
+    - Border-anchored large objects (desks, tables, cables, chair armrests touching bottom/side borders).
+    - Oversized low/medium-confidence indoor regions.
+    - Low internal complexity / dispersed textureless clutter.
     """
     if crop_bgr is None or crop_bgr.size == 0:
         return True
@@ -451,31 +469,36 @@ def is_furniture_or_background_false_positive(crop_bgr, bbox, frame_h, frame_w, 
     x1, y1, x2, y2 = bbox
     bw = x2 - x1
     bh = y2 - y1
-
-    # 1. Floor-anchored large objects (office chairs, desk pedestals, wheel bases)
-    # If bottom of bounding box is near the bottom edge (floor) and spans >24% of screen height with confidence < 0.60
-    if y2 >= 0.88 * frame_h and bh > 0.24 * frame_h and confidence < 0.60:
-        return True
-
-    # 2. Overly massive indoor boxes (taking up large fraction of screen) with sub-60% confidence
-    if (bw * bh) > (0.15 * frame_w * frame_h) and confidence < 0.60:
-        return True
-
-    # 3. Flat wall panels / desk dividers / office ceiling fixtures with extreme aspect ratio
     ar = float(bw) / max(1.0, float(bh))
-    if (ar < 0.40 or ar > 3.2) and confidence < 0.55:
+    area_ratio = float(bw * bh) / float(frame_w * frame_h)
+
+    # 1. Desk/Floor/Side-anchored border objects (tables, cables, chair armrests near bottom or side borders)
+    # If the box touches/nears the bottom border (y2 >= 0.70*H) or side border (x1 <= 25 or x2 >= W - 25)
+    # and spans a significant area (> 14% width or height) with confidence < 0.65
+    is_border_anchored = (y2 >= 0.70 * frame_h) or (x1 <= 25) or (x2 >= frame_w - 25)
+    if is_border_anchored and (bw > 0.14 * frame_w or bh > 0.14 * frame_h) and confidence < 0.65:
         return True
 
-    # 4. Homogeneous Dark / Textureless Chair Fabric & Wall Surfaces
-    if crop_bgr.shape[0] >= 30 and crop_bgr.shape[1] >= 30 and confidence < 0.52:
+    # 2. Oversized indoor regions (spanning > 3.5% of total screen area) with sub-55% confidence
+    if area_ratio > 0.035 and confidence < 0.55:
+        return True
+
+    # 3. Large regions (spanning > 7% of screen) with sub-65% confidence
+    if area_ratio > 0.07 and confidence < 0.65:
+        return True
+
+    # 4. Extreme or unnatural aspect ratios with low/medium confidence
+    if (ar < 0.45 or ar > 3.6) and confidence < 0.60:
+        return True
+
+    # 5. Low internal complexity / Textureless or dispersed background clutter
+    if crop_bgr.shape[0] >= 25 and crop_bgr.shape[1] >= 25 and confidence < 0.55:
         gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
         edges = cv2.Canny(gray, 40, 120)
         edge_density = np.count_nonzero(edges) / max(1, edges.size)
-        # Real drones have structured rotor blades/ducts/chassis (> 2.0% edge density)
-        if edge_density < 0.018:
+        if edge_density < 0.022:
             return True
-        # Chair cushions/backs: very dark with low internal texture variance
-        if np.mean(gray) < 45 and edge_density < 0.026:
+        if np.mean(gray) < 45 and edge_density < 0.032:
             return True
 
     return False
@@ -837,14 +860,14 @@ class TargetKinematics:
         return z_est, sigma_d, ci_low, ci_high, crlb_var, x_m, y_m
 
     def coast(self, dt):
-        """Dead-reckoning coasting forward during 1-4 frame detection dropouts to eliminate flicker."""
+        """Dead-reckoning coasting forward during 1-2 frame detection dropouts to eliminate flicker."""
         self.missed_frames += 1
-        self.last_conf *= 0.90  # Gradual confidence decay
+        self.last_conf *= 0.60  # Fast confidence decay when drone is occluded or removed
         if self.smoothed_bbox is not None and dt > 0:
             vx_p, vy_p = self.velocity_2d_px
             # Shift bounding box slightly with estimated 2D pixel velocity
-            dx = vx_p * dt * 0.5  # Damped coast
-            dy = vy_p * dt * 0.5
+            dx = vx_p * dt * 0.3  # Damped coast
+            dy = vy_p * dt * 0.3
             self.smoothed_bbox[0] += dx
             self.smoothed_bbox[1] += dy
             self.smoothed_bbox[2] += dx
@@ -859,8 +882,8 @@ tracks_db = {}
 MIN_CONSECUTIVE_FRAMES = 1  # Instant response for small mini drones
 MAX_MISSED_FRAMES = 25      # Generous track retention for hand-held & distant tests
 
-# UI State (Default 30% sensitivity: fast lock on textured backgrounds & distance)
-conf_percent = 30
+# UI State (Default 25% sensitivity: ensures solid instant lock on distant 3m+ targets)
+conf_percent = 25
 brightness_boost = 0
 clahe_enabled = False
 dragging_slider = False
@@ -967,7 +990,7 @@ while True:
         frame,
         persist=True,
         tracker="bytetrack.yaml",
-        conf=0.20,
+        conf=0.15,
         iou=0.45,
         imgsz=current_imgsz,
         device=DEVICE,
@@ -989,7 +1012,7 @@ while True:
             cls_id = int(box.cls[0])
             confidence = float(box.conf[0])
 
-            if cls_id != DRONE_CLASS_ID or confidence < 0.20:
+            if cls_id != DRONE_CLASS_ID or confidence < 0.15:
                 continue
 
             track_id = int(box.id[0]) if box.id is not None else 1
@@ -1015,14 +1038,36 @@ while True:
                 continue
 
             # Spatial Proximity Re-association (Preserves Track Lock when ByteTrack drops/reassigns ID)
+            # Gated by tight spatial distance, IoU overlap, and shape consistency to prevent hand hijacking
             active_tid = track_id
             u_det = (x1 + x2) / 2.0
             v_det = (y1 + y2) / 2.0
-            det_span = max(box_w, box_h)
+            det_area = float(box_w * box_h)
+            
             for exist_tid, exist_kin in tracks_db.items():
                 if exist_kin.smoothed_bbox is not None and exist_kin.missed_frames > 0:
+                    ex_x1, ex_y1, ex_x2, ex_y2 = exist_kin.smoothed_bbox
+                    ex_w = max(2.0, ex_x2 - ex_x1)
+                    ex_h = max(2.0, ex_y2 - ex_y1)
+                    ex_area = ex_w * ex_h
+                    
+                    # Compute IoU between detection and existing smoothed track
+                    ix1 = max(x1, ex_x1)
+                    iy1 = max(y1, ex_y1)
+                    ix2 = min(x2, ex_x2)
+                    iy2 = min(y2, ex_y2)
+                    iw = max(0.0, ix2 - ix1)
+                    ih = max(0.0, iy2 - iy1)
+                    inter = iw * ih
+                    union = det_area + ex_area - inter
+                    iou = inter / union if union > 0 else 0.0
+                    
                     dist = math.hypot(u_det - exist_kin.last_u_center, v_det - exist_kin.last_v_center)
-                    if dist < max(100.0, 2.0 * det_span):
+                    max_allowed_dist = max(35.0, min(100.0, 0.60 * max(ex_w, ex_h)))
+                    area_ratio = det_area / max(1.0, ex_area)
+                    
+                    # Match only if overlapping OR tightly centered with consistent size
+                    if (iou > 0.15) or (dist < max_allowed_dist and 0.40 <= area_ratio <= 2.5):
                         active_tid = exist_tid
                         break
 
@@ -1093,7 +1138,17 @@ while True:
 
             if is_duplicate:
                 target_kin.missed_frames = MAX_COAST_FRAMES + 1  # Expire duplicate immediately
-            elif target_kin.hits >= 2 and target_kin.missed_frames < MAX_COAST_FRAMES:
+            elif target_kin.hits >= 2 and target_kin.missed_frames < MAX_COAST_FRAMES and (current_time - (target_kin.last_timestamp or current_time)) < MAX_COAST_TIME:
+                # Check if occlusion (e.g. hand or barrier) is covering the drone position
+                if target_kin.smoothed_bbox is not None:
+                    cx1, cy1, cx2, cy2 = map(int, target_kin.smoothed_bbox)
+                    cx1, cy1 = max(0, cx1), max(0, cy1)
+                    cx2, cy2 = min(w, cx2), min(h, cy2)
+                    if (cx2 - cx1) > 10 and (cy2 - cy1) > 10:
+                        coast_crop = frame[cy1:cy2, cx1:cx2]
+                        if is_human_or_face_false_positive(coast_crop, float(cx2-cx1)/max(1.0, float(cy2-cy1)), 0.50):
+                            target_kin.missed_frames = MAX_COAST_FRAMES + 1
+                            continue
                 target_kin.coast(dt)
             else:
                 target_kin.missed_frames += 1
@@ -1105,13 +1160,13 @@ while True:
         if target_kin.smoothed_bbox is None:
             continue
             
-        # Hold firm target lock across up to MAX_COAST_FRAMES so the box never drops or flickers
+        # Immediately drop ghost tracks if missed frames exceed buffer or confidence decayed
         if target_kin.missed_frames > MAX_COAST_FRAMES:
             continue
 
         conf = target_kin.last_conf
-        # Solid Lock: Active if high confidence OR established track within coasting buffer
-        is_confirmed = (conf >= conf_threshold) or (target_kin.hits >= 2 and target_kin.missed_frames <= MAX_COAST_FRAMES)
+        # Solid Lock: Active only if confidence satisfies the sensitivity threshold
+        is_confirmed = (conf >= conf_threshold) or (target_kin.hits >= 2 and target_kin.missed_frames <= MAX_COAST_FRAMES and conf >= max(0.25, conf_threshold * 0.85))
         if not is_confirmed:
             continue
 
@@ -1327,14 +1382,14 @@ while True:
     clahe_tag = "[ON]" if clahe_enabled else ""
     gru_hud_tag = "[ON]" if USE_GRU_CORRECTION else "[OFF]"
     if is_video_file:
-        controls_msg = f"[L]: Learn | [U]: Reload Model | [S]: Shot | [G]: GRU{gru_hud_tag} | [K]: Calib | [SPACE]: Pause | Sens: [ / ] | Q: Quit"
+        controls_msg = f"[L]: Learn | [U]: Reload Model | [G]: GRU{gru_hud_tag} | [K]: Calib | [SPACE]: Pause | Sens: [ / ] | Q: Quit"
     else:
-        controls_msg = f"[L]: Learn | [U]: Reload Model | [S]: Shot | [G]: GRU{gru_hud_tag} | [K]: Calib | [C]: Contrast{clahe_tag} | Sens: [ / ] | Q: Quit"
+        controls_msg = f"[L]: Learn | [U]: Reload Model | [G]: GRU{gru_hud_tag} | [K]: Calib | [C]: Contrast{clahe_tag} | Sens: [ / ] | Q: Quit"
         
     (cw, _), _ = cv2.getTextSize(controls_msg, cv2.FONT_HERSHEY_SIMPLEX, 0.38, 1)
     cv2.putText(frame, controls_msg, (w - cw - 15, h - 17), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (190, 190, 190), 1, cv2.LINE_AA)
 
-    # Calibration / Screenshot Status Banner Overlay
+    # Calibration / Status Banner Overlay
     if calib_status_text and time.time() < calib_status_expiry:
         banner_w = 600
         banner_h = 32
@@ -1391,15 +1446,6 @@ while True:
             calib_status_text = f"ERROR Reloading Model: {e}"
             calib_status_expiry = time.time() + 4.0
             print(f"[!] Error reloading model: {e}")
-    elif key in (ord("s"), ord("S")):  # S: Take High-Res Screenshot of Full HUD & Detection Screen
-        screenshots_dir = Path("screenshots")
-        screenshots_dir.mkdir(parents=True, exist_ok=True)
-        ts_str = time.strftime("%Y%m%d_%H%M%S")
-        shot_path = screenshots_dir / f"capture_{ts_str}.jpg"
-        cv2.imwrite(str(shot_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
-        calib_status_text = f"SCREENSHOT SAVED: {shot_path.name}"
-        calib_status_expiry = time.time() + 3.0
-        print(f"\n[+] Full HUD Screenshot Saved: {shot_path.resolve()}\n")
     elif key in (ord("m"), ord("M")):  # M: Cycle Distance Estimation Mode (Width -> Height -> Fusion)
         modes = ["width", "height", "fusion"]
         curr_m_idx = modes.index(active_distance_mode) if active_distance_mode in modes else 0
